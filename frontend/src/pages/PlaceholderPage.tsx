@@ -1,0 +1,1 @@
+export function PlaceholderPage({ title, description }: { title: string; description: string }) { return <div className="placeholder"><span className="eyebrow">Phase 1 foundation</span><h1>{title}</h1><p>{description}</p><div className="placeholder-icon">✦</div></div>; }

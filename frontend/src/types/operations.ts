@@ -1,0 +1,4 @@
+export interface EventItem { id: number; camera_id?: number | null; kind: string; object_name?: string | null; confidence?: number | null; occurred_at: string; snapshot_path?: string | null; recording_id?: number | null; bounding_box?: Record<string, number> | null; duration_seconds?: number | null; }
+export interface Metrics { api: string; media: string; recording: string; ai: string; cpu?: number | null; ram?: number | null; gpu?: number | null; network?: string | null; host: string; storage: { total_bytes: number; used_bytes: number; free_bytes: number; low?: boolean }; }
+export interface Integration { id: number; name: string; kind: string; endpoint: string; auth_method: string; enabled: boolean; created_at: string; }
+export interface AlertItem { id: number; kind: string; message: string; status: string; created_at: string; }
