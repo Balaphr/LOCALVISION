@@ -1,8 +1,10 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
 from app.auth.security import hash_password
 from app.config import get_settings
-from app.database import Base, SessionLocal, engine
+from app.database import Base, get_db
 from app.main import app
 from app.models.auth import User
 
@@ -10,11 +12,21 @@ from app.models.auth import User
 @pytest.fixture(autouse=True)
 async def database():
     get_settings().encryption_key = "test-only-encryption-key"
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
-    yield
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.drop_all)
+
+    async def override_get_db():
+        async with session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        yield session_factory
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        await engine.dispose()
 
 
 @pytest.fixture
@@ -24,7 +36,12 @@ async def client():
 
 
 @pytest.mark.asyncio
-async def test_camera_crud(client):
+async def test_camera_crud(client, database):
+    async with database() as db:
+        db.add(User(username="camera-admin", password_hash=hash_password("camera-password"), role="admin"))
+        await db.commit()
+    login = await client.post("/api/auth/login", json={"username": "camera-admin", "password": "camera-password"})
+    assert login.status_code == 200
     payload = {"name": "Front door", "host": "192.168.1.20", "protocol": "RTSP", "password": "camera-secret"}
     created = await client.post("/api/cameras", json=payload)
     assert created.status_code == 201
@@ -40,8 +57,8 @@ async def test_camera_crud(client):
 
 
 @pytest.mark.asyncio
-async def test_authentication(client):
-    async with SessionLocal() as db:
+async def test_authentication(client, database):
+    async with database() as db:
         db.add(User(username="admin", password_hash=hash_password("correct-password"), role="admin"))
         await db.commit()
     response = await client.post("/api/auth/login", json={"username": "admin", "password": "correct-password"})

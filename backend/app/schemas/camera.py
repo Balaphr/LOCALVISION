@@ -75,3 +75,21 @@ class DiscoveryResult(BaseModel):
     model: str | None = None
     onvif_endpoint: str | None = None
     rtsp_url: str | None = None
+    port: int = 80
+    error: str | None = None
+
+
+class OnvifInspectionRequest(BaseModel):
+    endpoint: str = Field(min_length=1, max_length=500)
+    username: str | None = None
+    password: str | None = None
+
+
+class CameraTestResult(BaseModel):
+    camera_id: int | None = None
+    status: Literal["reachable", "unreachable"]
+    message: str
+    resolution: str | None = None
+    fps: float | None = None
+    preview: str | None = None
+    hints: str | None = None

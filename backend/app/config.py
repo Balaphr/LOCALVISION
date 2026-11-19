@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     retention_days: int = 7
     low_storage_percent: int = 10
     onvif_discovery_enabled: bool = False
+    yolo_model_path: str = "yolo11n.pt"
+    detection_confidence: float = 0.5
+    detection_fps: float = 5.0
+    event_cooldown_seconds: int = 20
+    clip_buffer_seconds: int = 5
+    surveillance_worker_enabled: bool = True
+    activity_description_endpoint: str | None = None
+    activity_description_model: str = "llava"
     admin_username: str = ""
     admin_password: str = ""
     allow_guest_mode: bool = False

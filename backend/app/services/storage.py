@@ -31,6 +31,12 @@ class LocalStorage:
         path.mkdir(parents=True, exist_ok=True)
         return path / filename
 
+    def relative(self, path: Path) -> str:
+        try:
+            return str(path.resolve().relative_to(self.root.resolve()))
+        except ValueError:
+            return str(path)
+
     def usage(self) -> StorageUsage:
         total, used, free = shutil.disk_usage(self.root)
         return StorageUsage(total, used, free)

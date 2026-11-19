@@ -2,13 +2,14 @@ import asyncio
 from urllib.parse import urlsplit
 from ..config import get_settings
 from ..schemas.camera import DiscoveryResult
+from .onvif_client import inspect_onvif_device
 
 
 async def discover_onvif_devices() -> list[DiscoveryResult]:
     if not get_settings().onvif_discovery_enabled:
         return []
 
-    def scan() -> list[DiscoveryResult]:
+    def scan() -> list[str]:
         try:
             from wsdiscovery.discovery import ThreadedWSDiscovery
         except ImportError:
@@ -16,14 +17,25 @@ async def discover_onvif_devices() -> list[DiscoveryResult]:
         discovery = ThreadedWSDiscovery()
         discovery.start()
         try:
-            devices: list[DiscoveryResult] = []
+            addresses: list[str] = []
             for service in discovery.searchServices():
                 address = next(iter(service.getXAddrs()), "")
-                host = urlsplit(address).hostname
-                if host:
-                    devices.append(DiscoveryResult(ip=host, onvif_endpoint=address))
-            return devices
+                if address:
+                    addresses.append(address)
+            return list(dict.fromkeys(addresses))
         finally:
             discovery.stop()
 
-    return await asyncio.to_thread(scan)
+    endpoints = await asyncio.to_thread(scan)
+    results: list[DiscoveryResult] = []
+    seen: set[str] = set()
+    for endpoint in endpoints:
+        parsed = urlsplit(endpoint)
+        host = parsed.hostname
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        port = parsed.port or 80
+        device = await inspect_onvif_device(host, port, endpoint=endpoint)
+        results.append(DiscoveryResult(ip=host, manufacturer=device.manufacturer, model=device.model, onvif_endpoint=endpoint, rtsp_url=device.rtsp_url, port=port, error=device.error))
+    return results

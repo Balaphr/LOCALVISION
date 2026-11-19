@@ -1,2 +1,1 @@
-import { SplashScreen } from "./components/SplashScreen";
-import { LandingPage } from "./pages/LandingPage";
+export { default } from "../App";

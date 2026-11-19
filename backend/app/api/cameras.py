@@ -3,12 +3,14 @@ from pydantic import AnyHttpUrl, BaseModel, Field, ValidationError
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from urllib.parse import urlsplit
 from ..auth.security import encrypt_secret
 from ..cameras.discovery import discover_onvif_devices
-from ..cameras.factory import provider_for
+from ..cameras.onvif_client import inspect_onvif_device
 from ..database import get_db
 from ..models.camera import Camera
-from ..schemas.camera import CameraCreate, CameraRead, CameraStatus, CameraUpdate, DiscoveryResult
+from ..schemas.camera import CameraCreate, CameraRead, CameraStatus, CameraTestResult, CameraUpdate, DiscoveryResult, OnvifInspectionRequest
+from ..services.streams import frame_hub, probe_camera
 from ..auth.rbac import require_minimum_role
 from ..models.auth import User
 from ..services.audit import write_audit
@@ -92,6 +94,23 @@ async def import_cameras(
     return {"imported": imported, "skipped": len(candidates) - imported}
 
 
+@router.post("/test", response_model=CameraTestResult)
+async def test_camera_draft(payload: CameraCreate, _: User = Depends(require_minimum_role("operator"))) -> CameraTestResult:
+    draft = Camera(**payload.model_dump(exclude={"password"}), encrypted_password=encrypt_secret(payload.password))
+    result = await probe_camera(draft)
+    return CameraTestResult(status=result.status, message=result.message, resolution=result.resolution, fps=result.fps, preview=result.preview, hints=None if result.status == "reachable" else result.message)
+
+
+@router.post("/onvif/inspect", response_model=DiscoveryResult)
+async def inspect_onvif(payload: OnvifInspectionRequest, _: User = Depends(require_minimum_role("operator"))) -> DiscoveryResult:
+    parsed = urlsplit(payload.endpoint)
+    host = parsed.hostname
+    if not host:
+        raise HTTPException(status_code=422, detail="Enter a valid ONVIF endpoint URL")
+    device = await inspect_onvif_device(host, parsed.port or 80, payload.username, payload.password, payload.endpoint)
+    return DiscoveryResult(ip=device.ip, manufacturer=device.manufacturer, model=device.model, onvif_endpoint=device.endpoint, rtsp_url=device.rtsp_url, port=parsed.port or 80, error=device.error)
+
+
 async def get_camera(camera_id: int, db: AsyncSession) -> Camera:
     camera = await db.get(Camera, camera_id)
     if not camera:
@@ -126,17 +145,18 @@ async def delete_camera(camera_id: int, request: Request, user: User = Depends(r
     await db.commit()
 
 
-@router.post("/{camera_id}/test")
-async def test_camera(camera_id: int, _: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> dict[str, object]:
+@router.post("/{camera_id}/test", response_model=CameraTestResult)
+async def test_camera(camera_id: int, _: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> CameraTestResult:
     camera = await get_camera(camera_id, db)
-    provider = provider_for(camera)
-    connected = await provider.test_connection()
-    return {"camera_id": camera.id, "status": "reachable" if connected else "unreachable", "message": "Provider validation passed" if connected else "No usable stream endpoint configured"}
+    result = await probe_camera(camera)
+    return CameraTestResult(camera_id=camera.id, status=result.status, message=result.message, resolution=result.resolution, fps=result.fps, preview=result.preview, hints=None if result.status == "reachable" else result.message)
 
 
 @router.get("/{camera_id}/status", response_model=CameraStatus)
 async def camera_status(camera_id: int, _: User = Depends(require_minimum_role("viewer")), db: AsyncSession = Depends(get_db)) -> CameraStatus:
     camera = await get_camera(camera_id, db)
-    provider = provider_for(camera)
-    info = await provider.get_stream_info()
-    return CameraStatus(camera_id=camera.id, status=await provider.get_status(), protocol=camera.protocol, resolution=info.resolution, fps=info.fps)
+    live = frame_hub.status(camera.id)
+    if live["status"] in {"online", "reconnecting"}:
+        return CameraStatus(camera_id=camera.id, status="online" if live["status"] == "online" else "offline", protocol=camera.protocol, message=str(live["message"]) if live["message"] else None)
+    result = await probe_camera(camera, timeout=3)
+    return CameraStatus(camera_id=camera.id, status="online" if result.status == "reachable" else "offline", protocol=camera.protocol, resolution=result.resolution, fps=result.fps, message=result.message)

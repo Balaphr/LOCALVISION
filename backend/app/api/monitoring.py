@@ -6,8 +6,10 @@ try:
 except ImportError:
     psutil = None
 from fastapi import APIRouter
+from ..ai.detector import detector
 from ..config import get_settings
 from ..services.storage import LocalStorage
+from ..services.surveillance import surveillance_worker
 
 router = APIRouter(tags=["monitoring"])
 
@@ -15,7 +17,8 @@ router = APIRouter(tags=["monitoring"])
 def snapshot() -> dict[str, object]:
     usage = LocalStorage().usage()
     settings = get_settings()
-    return {"api": "ok", "media": "not_started", "recording": "not_started", "ai": "not_loaded", "storage": {"total_bytes": usage.total_bytes, "used_bytes": usage.used_bytes, "free_bytes": usage.free_bytes, "low": LocalStorage().is_low(settings.low_storage_percent)}, "cpu": psutil.cpu_percent() if psutil else None, "ram": psutil.virtual_memory().percent if psutil else None, "gpu": None, "network": None, "host": platform.node()}
+    surveillance = "running" if surveillance_worker.running else "stopped"
+    return {"api": "ok", "media": surveillance, "recording": surveillance, "ai": detector.active, "storage": {"total_bytes": usage.total_bytes, "used_bytes": usage.used_bytes, "free_bytes": usage.free_bytes, "low": LocalStorage().is_low(settings.low_storage_percent)}, "cpu": psutil.cpu_percent() if psutil else None, "ram": psutil.virtual_memory().percent if psutil else None, "gpu": None, "network": None, "host": platform.node()}
 
 
 @router.get("/health")
@@ -45,4 +48,4 @@ async def system() -> dict[str, object]:
 
 @router.get("/api/ai")
 async def ai() -> dict[str, object]:
-    return {"provider": "ultralytics-yolo", "model": "yolo11n", "status": "not_loaded", "local_only": True}
+    return detector.status()

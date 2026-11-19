@@ -29,6 +29,9 @@ class Event(Base):
     recording_id: Mapped[int | None] = mapped_column(ForeignKey("recordings.id", ondelete="SET NULL"))
     bounding_box: Mapped[dict | None] = mapped_column(JSON)
     duration_seconds: Mapped[float | None] = mapped_column(Float)
+    description: Mapped[str | None] = mapped_column(Text)
+    track_id: Mapped[str | None] = mapped_column(String(40))
+    clip_path: Mapped[str | None] = mapped_column(Text)
 
 
 class Alert(Base):
