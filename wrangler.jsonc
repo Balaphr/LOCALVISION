@@ -1,6 +1,10 @@
 {
   "name": "localvision",
   "compatibility_date": "2026-11-19",
+  "build": {
+    "command": "npm --prefix frontend install && npm --prefix frontend run build",
+    "watch_dir": "frontend"
+  },
   "assets": {
     "directory": "./frontend/dist",
     "not_found_handling": "single-page-application"
