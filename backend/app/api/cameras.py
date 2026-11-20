@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from urllib.parse import urlsplit
+from ..auth.access import accessible_camera_ids, get_accessible_camera
 from ..auth.security import encrypt_secret
 from ..cameras.discovery import discover_onvif_devices
 from ..cameras.onvif_client import inspect_onvif_device
@@ -24,15 +25,16 @@ class CameraImportRequest(BaseModel):
 
 
 @router.get("", response_model=list[CameraRead])
-async def list_cameras(_: User = Depends(require_minimum_role("viewer")), db: AsyncSession = Depends(get_db)) -> list[Camera]:
-    result = await db.execute(select(Camera).order_by(Camera.created_at.desc()))
+async def list_cameras(user: User = Depends(require_minimum_role("viewer")), db: AsyncSession = Depends(get_db)) -> list[Camera]:
+    camera_ids = await accessible_camera_ids(user, db)
+    result = await db.execute(select(Camera).where(Camera.id.in_(camera_ids)).order_by(Camera.created_at.desc()))
     return list(result.scalars())
 
 
 @router.post("", response_model=CameraRead, status_code=status.HTTP_201_CREATED)
 async def create_camera(payload: CameraCreate, request: Request, user: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> Camera:
     camera_data = payload.model_dump(exclude={"password"})
-    camera = Camera(**camera_data, encrypted_password=encrypt_secret(payload.password))
+    camera = Camera(**camera_data, owner_id=user.id, encrypted_password=encrypt_secret(payload.password))
     db.add(camera)
     await write_audit(db, request, user, "camera.created", "camera")
     await db.commit()
@@ -84,7 +86,7 @@ async def import_cameras(
         if identity in existing:
             continue
         data = candidate.model_dump(exclude={"password"})
-        db.add(Camera(**data, encrypted_password=encrypt_secret(candidate.password)))
+        db.add(Camera(**data, owner_id=user.id, encrypted_password=encrypt_secret(candidate.password)))
         existing.add(identity)
         imported += 1
 
@@ -111,21 +113,18 @@ async def inspect_onvif(payload: OnvifInspectionRequest, _: User = Depends(requi
     return DiscoveryResult(ip=device.ip, manufacturer=device.manufacturer, model=device.model, onvif_endpoint=device.endpoint, rtsp_url=device.rtsp_url, port=parsed.port or 80, error=device.error)
 
 
-async def get_camera(camera_id: int, db: AsyncSession) -> Camera:
-    camera = await db.get(Camera, camera_id)
-    if not camera:
-        raise HTTPException(status_code=404, detail="Camera not found")
-    return camera
+async def get_camera(camera_id: int, db: AsyncSession, user: User, access: str = "view") -> Camera:
+    return await get_accessible_camera(camera_id, user, db, access)
 
 
 @router.get("/{camera_id}", response_model=CameraRead)
-async def read_camera(camera_id: int, _: User = Depends(require_minimum_role("viewer")), db: AsyncSession = Depends(get_db)) -> Camera:
-    return await get_camera(camera_id, db)
+async def read_camera(camera_id: int, user: User = Depends(require_minimum_role("viewer")), db: AsyncSession = Depends(get_db)) -> Camera:
+    return await get_camera(camera_id, db, user)
 
 
 @router.put("/{camera_id}", response_model=CameraRead)
 async def update_camera(camera_id: int, payload: CameraUpdate, request: Request, user: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> Camera:
-    camera = await get_camera(camera_id, db)
+    camera = await get_camera(camera_id, db, user, "manage")
     data = payload.model_dump(exclude_unset=True, exclude={"password"})
     for key, value in data.items():
         setattr(camera, key, value)
@@ -139,22 +138,22 @@ async def update_camera(camera_id: int, payload: CameraUpdate, request: Request,
 
 @router.delete("/{camera_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_camera(camera_id: int, request: Request, user: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> None:
-    camera = await get_camera(camera_id, db)
+    camera = await get_camera(camera_id, db, user, "manage")
     await db.delete(camera)
     await write_audit(db, request, user, "camera.deleted", str(camera_id))
     await db.commit()
 
 
 @router.post("/{camera_id}/test", response_model=CameraTestResult)
-async def test_camera(camera_id: int, _: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> CameraTestResult:
-    camera = await get_camera(camera_id, db)
+async def test_camera(camera_id: int, user: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> CameraTestResult:
+    camera = await get_camera(camera_id, db, user, "manage")
     result = await probe_camera(camera)
     return CameraTestResult(camera_id=camera.id, status=result.status, message=result.message, resolution=result.resolution, fps=result.fps, preview=result.preview, hints=None if result.status == "reachable" else result.message)
 
 
 @router.post("/{camera_id}/test-draft", response_model=CameraTestResult)
-async def test_camera_draft(camera_id: int, payload: CameraCreate, _: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> CameraTestResult:
-    camera = await get_camera(camera_id, db)
+async def test_camera_draft(camera_id: int, payload: CameraCreate, user: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> CameraTestResult:
+    camera = await get_camera(camera_id, db, user, "manage")
     data = payload.model_dump(exclude={"password"})
     encrypted_password = camera.encrypted_password if not payload.password and payload.username == camera.username else encrypt_secret(payload.password)
     draft = Camera(**data, encrypted_password=encrypted_password)
@@ -163,8 +162,8 @@ async def test_camera_draft(camera_id: int, payload: CameraCreate, _: User = Dep
 
 
 @router.get("/{camera_id}/status", response_model=CameraStatus)
-async def camera_status(camera_id: int, _: User = Depends(require_minimum_role("viewer")), db: AsyncSession = Depends(get_db)) -> CameraStatus:
-    camera = await get_camera(camera_id, db)
+async def camera_status(camera_id: int, user: User = Depends(require_minimum_role("viewer")), db: AsyncSession = Depends(get_db)) -> CameraStatus:
+    camera = await get_camera(camera_id, db, user)
     live = frame_hub.status(camera.id)
     if live["status"] in {"online", "reconnecting"}:
         return CameraStatus(camera_id=camera.id, status="online" if live["status"] == "online" else "offline", protocol=camera.protocol, message=str(live["message"]) if live["message"] else None)

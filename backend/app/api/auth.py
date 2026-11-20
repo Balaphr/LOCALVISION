@@ -3,8 +3,8 @@ import secrets
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from ..auth.schemas import LoginRequest, LoginResponse, UserRead
-from ..auth.security import verify_password
+from ..auth.schemas import ChangePasswordRequest, LoginRequest, LoginResponse, UserRead
+from ..auth.security import hash_password, verify_password
 from ..config import get_settings
 from ..database import get_db
 from ..models.auth import Session, User
@@ -18,6 +18,8 @@ async def login(payload: LoginRequest, request: Request, response: Response, db:
     user = (await db.execute(select(User).where(User.username == payload.username))).scalar_one_or_none()
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
+    if not getattr(user, "is_active", True):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is disabled")
     token = secrets.token_urlsafe(48)
     session = Session(id=token, user_id=user.id, expires_at=datetime.now(timezone.utc) + timedelta(hours=get_settings().session_hours))
     db.add(session)
@@ -58,6 +60,8 @@ async def current_user(request: Request, db: AsyncSession = Depends(get_db)) -> 
     user = await db.get(User, session.user_id)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    if not getattr(user, "is_active", True):
+        raise HTTPException(status_code=403, detail="Account is disabled")
     return user
 
 
@@ -77,3 +81,16 @@ async def logout(request: Request, response: Response, db: AsyncSession = Depend
 @router.get("/me", response_model=UserRead)
 async def me(user: User = Depends(current_user)) -> User:
     return user
+
+
+@router.post("/password", status_code=status.HTTP_204_NO_CONTENT)
+async def change_password(payload: ChangePasswordRequest, request: Request, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)) -> None:
+    if not verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
+    user.password_hash = hash_password(payload.new_password)
+    token = request.cookies.get("localvision_session")
+    sessions = (await db.execute(select(Session).where(Session.user_id == user.id, Session.id != token))).scalars()
+    for session in sessions:
+        await db.delete(session)
+    await write_audit(db, request, user, "password.changed", "account")
+    await db.commit()

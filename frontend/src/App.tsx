@@ -17,6 +17,8 @@ import { SystemPage } from "./pages/SystemPage";
 import { LandingPage } from "./pages/LandingPage";
 import { AccountSettings } from "./pages/AccountSettings";
 import { SharingPage } from "./pages/SharingPage";
+import { StoragePage } from "./pages/StoragePage";
+import { UsersPage } from "./pages/UsersPage";
 import type { User } from "./types/auth";
 import { useRealtime } from "./hooks/useRealtime";
 import type { RealtimeMessage } from "./hooks/useRealtime";
@@ -140,10 +142,13 @@ export default function App() {
     : page === "events" ? <EventsPage cameras={cameras} />
     : page === "alerts" ? <AlertsPage canWrite={canWrite} />
     : page === "sharing" ? <SharingPage canWrite={canWrite} />
+    : page === "storage" ? (user.role === "admin" ? <StoragePage /> : <PlaceholderPage title="Storage access restricted" description="Only administrators can review global storage capacity and server connections." />)
+    : page === "users" ? (user.role === "admin" ? <UsersPage currentUser={user} /> : <PlaceholderPage title="User management restricted" description="Only administrators can manage accounts and permissions." />)
     : page === "integrations" ? <IntegrationsPage canWrite={canWrite} />
     : page === "settings" ? <AccountSettings user={user} canManageUsers={canManageUsers} onLogout={async () => { try { await authApi.logout(); } finally { setUser(null); setPage("dashboard"); setShowSplash(false); } }} />
     : page === "system" ? <SystemPage />
     : <PlaceholderPage title={labels[page]?.[0] ?? page} description={labels[page]?.[1] ?? "This area is ready for the next implementation phase."} />;
 
-  return <div className="app"><Sidebar active={page} onNavigate={setPage} /><main className="main"><header className="topbar"><button className="mobile-menu" onClick={() => document.querySelector('.sidebar')?.classList.toggle('open')}>☰</button><div className="user-area"><span className="connection"><i /> {user.role.toUpperCase()} · session active</span><button className="avatar" aria-label="Open account settings" onClick={() => setPage("settings")}>{user.username.slice(0, 2).toUpperCase()}</button></div></header>{notice && <div className="notice" onClick={() => setNotice("")}>{notice} <b>×</b></div>}{content}</main>{formOpen && <div className="modal-backdrop"><CameraForm camera={editing} onSave={save} onCancel={() => { setFormOpen(false); setEditing(null); }} /></div>}</div>;
+    return <div className="app"><Sidebar active={page} role={user.role} onNavigate={setPage} /><main className="main">
+<header className="topbar"><button className="mobile-menu" onClick={() => document.querySelector('.sidebar')?.classList.toggle('open')}>☰</button><div className="user-area"><span className="connection"><i /> {user.role.toUpperCase()} · session active</span><button className="avatar" aria-label="Open account settings" onClick={() => setPage("settings")}>{user.username.slice(0, 2).toUpperCase()}</button></div></header>{notice && <div className="notice" onClick={() => setNotice("")}>{notice} <b>×</b></div>}{content}</main>{formOpen && <div className="modal-backdrop"><CameraForm camera={editing} onSave={save} onCancel={() => { setFormOpen(false); setEditing(null); }} /></div>}</div>;
 }

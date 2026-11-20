@@ -4,17 +4,43 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 logger = logging.getLogger(__name__)
 
-EVENT_COLUMNS = {
-    "description": "TEXT",
-    "track_id": "VARCHAR(40)",
-    "clip_path": "TEXT",
+TABLE_COLUMNS = {
+    "events": {
+        "description": ("TEXT", None),
+        "track_id": ("VARCHAR(40)", None),
+        "clip_path": ("TEXT", None),
+    },
+    "users": {
+        "permissions": ("TEXT", "'{}'"),
+        "is_active": ("BOOLEAN", "1"),
+    },
+    "cameras": {
+        "owner_id": ("INTEGER", None),
+    },
+    "alerts": {
+        "camera_id": ("INTEGER", None),
+    },
 }
 
 
-async def ensure_surveillance_columns(engine: AsyncEngine) -> None:
+async def ensure_runtime_columns(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
-        columns = {column["name"] for column in await connection.run_sync(lambda sync: inspect(sync).get_columns("events"))}
-        for name, column_type in EVENT_COLUMNS.items():
-            if name not in columns:
-                await connection.execute(text(f"ALTER TABLE events ADD COLUMN {name} {column_type}"))
-                logger.info("Added events.%s column", name)
+        tables = set(await connection.run_sync(lambda sync: inspect(sync).get_table_names()))
+        for table, columns in TABLE_COLUMNS.items():
+            if table not in tables:
+                continue
+            existing = {column["name"] for column in await connection.run_sync(lambda sync, name=table: inspect(sync).get_columns(name))}
+            for name, (column_type, default_value) in columns.items():
+                if name in existing:
+                    continue
+                statement = f"ALTER TABLE {table} ADD COLUMN {name} {column_type}"
+                if default_value is not None:
+                    statement += f" DEFAULT {default_value}"
+                await connection.execute(text(statement))
+                logger.info("Added %s.%s column", table, name)
+        if {"cameras", "users"}.issubset(tables):
+            await connection.execute(text("UPDATE cameras SET owner_id = (SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1) WHERE owner_id IS NULL"))
+
+
+async def ensure_surveillance_columns(engine: AsyncEngine) -> None:
+    await ensure_runtime_columns(engine)

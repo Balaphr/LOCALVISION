@@ -5,9 +5,11 @@ try:
     import psutil
 except ImportError:
     psutil = None
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from ..ai.detector import detector
+from ..auth.rbac import require_minimum_role, require_permission
 from ..config import get_settings
+from ..models.auth import User
 from ..services.storage import LocalStorage
 from ..services.surveillance import surveillance_worker
 
@@ -33,20 +35,20 @@ async def ready() -> dict[str, str]:
 
 @router.get("/metrics")
 @router.get("/api/metrics")
-async def metrics() -> dict[str, object]:
+async def metrics(_: User = Depends(require_minimum_role("operator"))) -> dict[str, object]:
     return snapshot()
 
 
 @router.get("/api/storage")
-async def storage() -> dict[str, object]:
+async def storage(_: User = Depends(require_permission("storage.manage"))) -> dict[str, object]:
     return snapshot()["storage"]
 
 
 @router.get("/api/system")
-async def system() -> dict[str, object]:
+async def system(_: User = Depends(require_minimum_role("operator"))) -> dict[str, object]:
     return snapshot()
 
 
 @router.get("/api/ai")
-async def ai() -> dict[str, object]:
+async def ai(_: User = Depends(require_minimum_role("viewer"))) -> dict[str, object]:
     return detector.status()

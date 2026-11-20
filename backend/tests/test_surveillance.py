@@ -92,8 +92,11 @@ def test_zone_ignore_and_line_crossing():
 async def test_events_search_and_alert_acknowledge(client, database):
     await login(client, database)
     async with database() as db:
-        db.add(Event(camera_id=1, kind="entrance_approach", object_name="person", confidence=0.94, occurred_at=datetime.now(timezone.utc), description="Person approaching the main door.", track_id="7"))
-        db.add(Alert(kind="entrance_approach", message="Front door: Person approaching the main door.", status="open"))
+        camera = Camera(name="Front door", host="192.0.2.10")
+        db.add(camera)
+        await db.flush()
+        db.add(Event(camera_id=camera.id, kind="entrance_approach", object_name="person", confidence=0.94, occurred_at=datetime.now(timezone.utc), description="Person approaching the main door.", track_id="7"))
+        db.add(Alert(camera_id=camera.id, kind="entrance_approach", message="Front door: Person approaching the main door.", status="open"))
         await db.commit()
     events = await client.get("/api/events?search=approaching")
     assert events.status_code == 200

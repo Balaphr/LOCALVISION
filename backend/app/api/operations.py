@@ -3,11 +3,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from ..auth.access import accessible_camera_ids, get_accessible_camera
 from ..database import get_db
+from ..models.auth import User
 from ..models.operations import Event, Recording
 from ..services.storage import LocalStorage
 from ..auth.rbac import require_minimum_role
-from ..models.auth import User
 
 router = APIRouter(tags=["operations"])
 
@@ -30,8 +31,9 @@ def event_json(event: Event) -> dict[str, object]:
 
 
 @router.get("/api/recordings")
-async def recordings(_: User = Depends(require_minimum_role("viewer")), page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), camera_id: int | None = None, date: str | None = None, db: AsyncSession = Depends(get_db)) -> dict[str, object]:
-    query = select(Recording).order_by(Recording.started_at.desc()).offset((page - 1) * page_size).limit(page_size)
+async def listings(user: User = Depends(require_minimum_role("viewer")), page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), camera_id: int | None = None, date: str | None = None, db: AsyncSession = Depends(get_db)) -> dict[str, object]:
+    camera_ids = await accessible_camera_ids(user, db)
+    query = select(Recording).where(Recording.camera_id.in_(camera_ids)).order_by(Recording.started_at.desc()).offset((page - 1) * page_size).limit(page_size)
     if camera_id is not None: query = query.where(Recording.camera_id == camera_id)
     if date: query = query.where(Recording.started_at >= parse_datetime(date, "date"))
     result = await db.execute(query)
@@ -39,24 +41,27 @@ async def recordings(_: User = Depends(require_minimum_role("viewer")), page: in
 
 
 @router.get("/api/cameras/{camera_id}/recordings")
-async def camera_recordings(camera_id: int, _: User = Depends(require_minimum_role("viewer")), page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), db: AsyncSession = Depends(get_db)) -> dict[str, object]:
+async def camera_recordings(camera_id: int, user: User = Depends(require_minimum_role("viewer")), page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), db: AsyncSession = Depends(get_db)) -> dict[str, object]:
+    await get_accessible_camera(camera_id, user, db)
     result = await db.execute(select(Recording).where(Recording.camera_id == camera_id).order_by(Recording.started_at.desc()).offset((page - 1) * page_size).limit(page_size))
     return {"items": [recording_json(recording) for recording in result.scalars()], "page": page, "page_size": page_size}
 
 
 @router.get("/api/recordings/{recording_id}/file")
-async def recording_file(recording_id: int, _: User = Depends(require_minimum_role("viewer")), db: AsyncSession = Depends(get_db)) -> FileResponse:
+async def recording_file(recording_id: int, user: User = Depends(require_minimum_role("viewer")), db: AsyncSession = Depends(get_db)) -> FileResponse:
     recording = await db.get(Recording, recording_id)
     if not recording: raise HTTPException(status_code=404, detail="Recording not found")
+    await get_accessible_camera(recording.camera_id, user, db)
     path = (LocalStorage().root / recording.path).resolve()
     if not path.is_relative_to(LocalStorage().root.resolve()) or not path.is_file(): raise HTTPException(status_code=404, detail="Recording file not found")
     return FileResponse(path, media_type="video/mp4", content_disposition_type="inline")
 
 
 @router.delete("/api/recordings/{recording_id}", status_code=204)
-async def delete_recording(recording_id: int, _: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> None:
+async def delete_recording(recording_id: int, user: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> None:
     recording = await db.get(Recording, recording_id)
     if not recording: raise HTTPException(status_code=404, detail="Recording not found")
+    await get_accessible_camera(recording.camera_id, user, db, "manage")
     path = (LocalStorage().root / recording.path).resolve()
     if path.is_relative_to(LocalStorage().root.resolve()) and path.is_file(): path.unlink()
     await db.delete(recording); await db.commit()
@@ -65,6 +70,7 @@ async def delete_recording(recording_id: int, _: User = Depends(require_minimum_
 def _filtered_events(
     page: int,
     page_size: int,
+    camera_ids: list[int],
     camera_id: int | None,
     search: str | None,
     object_name: str | None,
@@ -73,7 +79,7 @@ def _filtered_events(
     end: str | None,
     min_confidence: float | None,
 ) -> object:
-    query = select(Event).order_by(Event.occurred_at.desc()).offset((page - 1) * page_size).limit(page_size)
+    query = select(Event).where(Event.camera_id.in_(camera_ids)).order_by(Event.occurred_at.desc()).offset((page - 1) * page_size).limit(page_size)
     if camera_id is not None:
         query = query.where(Event.camera_id == camera_id)
     if search:
@@ -94,7 +100,7 @@ def _filtered_events(
 
 @router.get("/api/events")
 async def events(
-    _: User = Depends(require_minimum_role("viewer")),
+    user: User = Depends(require_minimum_role("viewer")),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     camera_id: int | None = None,
@@ -106,14 +112,15 @@ async def events(
     min_confidence: float | None = Query(None, ge=0, le=1),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, object]:
-    query = _filtered_events(page, page_size, camera_id, search, object_name, kind, start, end, min_confidence)
+    camera_ids = await accessible_camera_ids(user, db)
+    query = _filtered_events(page, page_size, camera_ids, camera_id, search, object_name, kind, start, end, min_confidence)
     result = await db.execute(query)
     return {"items": [event_json(event) for event in result.scalars()], "page": page, "page_size": page_size}
 
 
 @router.get("/api/detections")
 async def detections(
-    _: User = Depends(require_minimum_role("viewer")),
+    user: User = Depends(require_minimum_role("viewer")),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     camera_id: int | None = None,
@@ -125,7 +132,8 @@ async def detections(
     min_confidence: float | None = Query(None, ge=0, le=1),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, object]:
-    query = _filtered_events(page, page_size, camera_id, search, object_name, kind, start, end, min_confidence)
+    camera_ids = await accessible_camera_ids(user, db)
+    query = _filtered_events(page, page_size, camera_ids, camera_id, search, object_name, kind, start, end, min_confidence)
     query = query.where(Event.object_name.is_not(None))
     result = await db.execute(query)
     return {"items": [event_json(event) for event in result.scalars()], "page": page, "page_size": page_size}

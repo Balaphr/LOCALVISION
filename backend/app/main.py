@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from .api import alerts, audit, auth, cameras, integrations, media, monitoring, operations, realtime, settings as settings_api, sharing, surveillance, system, users, zones
+from .api import alerts, audit, auth, cameras, integrations, media, monitoring, operations, realtime, settings as settings_api, sharing, storage, surveillance, system, users, zones
 from .config import get_settings
 from .database import Base, SessionLocal, engine
 from .models import Camera, Role, Session, User  # noqa: F401
@@ -85,6 +85,7 @@ app.include_router(zones.router)
 app.include_router(audit.router)
 app.include_router(alerts.router)
 app.include_router(sharing.router)
+app.include_router(storage.router)
 app.include_router(surveillance.router)
 
 if settings.environment == "production":

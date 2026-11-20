@@ -183,7 +183,7 @@ class SurveillanceWorker:
                 track_id=str(track.id),
                 clip_path=storage.relative(clip_path) if clip_path else None,
             )
-            alert = Alert(kind="entrance_approach", message=f"{camera.name}: {description}", status="open")
+            alert = Alert(camera_id=camera.id, kind="entrance_approach", message=f"{camera.name}: {description}", status="open")
             db.add(event)
             db.add(alert)
             await db.commit()

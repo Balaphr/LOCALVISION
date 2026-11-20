@@ -1,7 +1,8 @@
 import type { Camera, CameraInput } from "../types/camera";
 import type { RecordingPage, Zone, ZoneInput } from "../types/recording";
 import type { AiStatus, AlertItem, CameraTestResult, DiscoveryResult, EventItem, Integration, IntegrationInput, Metrics } from "../types/operations";
-import type { LoginResponse, Share, User } from "../types/auth";
+import type { LoginResponse, Role, Share, User, UserRecord } from "../types/auth";
+import type { StorageIntegration, StorageIntegrationInput, StorageOverview, StorageProbe } from "../types/storage";
 
 const request = async <T>(path: string, options?: RequestInit): Promise<T> => {
   const headers = new Headers(options?.headers);
@@ -82,13 +83,27 @@ export const authApi = {
   login: (username: string, password: string, rememberMe: boolean) => request<LoginResponse>("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password, remember_me: rememberMe }) }),
   guest: () => request<LoginResponse>("/api/auth/guest", { method: "POST" }),
   me: () => request<User>("/api/auth/me"),
-  logout: () => request<void>("/api/auth/logout", { method: "POST" })
+  logout: () => request<void>("/api/auth/logout", { method: "POST" }),
+  changePassword: (currentPassword: string, newPassword: string) => request<void>("/api/auth/password", { method: "POST", body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }) })
 };
 
+export interface UserInput { username: string; password?: string; role: Role; permissions?: Record<string, boolean>; is_active: boolean; }
+
 export const userApi = {
-  list: () => request<{ id: number; username: string; role: string }[]>("/api/users"),
-  create: (username: string, password: string, role: string) => request<{ id: number; username: string; role: string }>("/api/users", { method: "POST", body: JSON.stringify({ username, password, role }) }),
-  remove: (id: number) => request<void>(`/api/users/${id}`, { method: "DELETE" })
+  list: () => request<UserRecord[]>("/api/users"),
+  create: (input: UserInput) => request<UserRecord>("/api/users", { method: "POST", body: JSON.stringify(input) }),
+  update: (id: number, input: Partial<UserInput>) => request<UserRecord>(`/api/users/${id}`, { method: "PATCH", body: JSON.stringify(input) }),
+  remove: (id: number) => request<void>(`/api/users/${id}`, { method: "DELETE" }),
+  revokeSessions: (id: number) => request<void>(`/api/users/${id}/sessions/revoke`, { method: "POST" })
+};
+
+export const storageApi = {
+  overview: () => request<StorageOverview>("/api/storage/overview"),
+  list: () => request<StorageIntegration[]>("/api/storage/servers"),
+  create: (input: StorageIntegrationInput) => request<StorageIntegration>("/api/storage/servers", { method: "POST", body: JSON.stringify(input) }),
+  update: (id: number, input: Partial<StorageIntegrationInput>) => request<StorageIntegration>(`/api/storage/servers/${id}`, { method: "PATCH", body: JSON.stringify(input) }),
+  remove: (id: number) => request<void>(`/api/storage/servers/${id}`, { method: "DELETE" }),
+  test: (id: number) => request<StorageProbe>(`/api/storage/servers/${id}/test`, { method: "POST" })
 };
 
 export const settingsApi = { get: () => request<{ version: string; environment: string; storage_path: string; secrets_configured: boolean }>("/api/settings") };
