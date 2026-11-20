@@ -3,7 +3,7 @@
   "compatibility_date": "2026-11-19",
   "main": "worker.ts",
   "build": {
-    "command": "npm --prefix frontend install && npm --prefix frontend run build",
+    "command": "node scripts/build-if-needed.mjs",
     "watch_dir": "frontend"
   },
   "assets": {
