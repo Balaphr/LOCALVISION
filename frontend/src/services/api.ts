@@ -1,14 +1,16 @@
 import type { Camera, CameraInput } from "../types/camera";
 import type { RecordingPage, Zone, ZoneInput } from "../types/recording";
-import type { AiStatus, AlertItem, CameraTestResult, DiscoveryResult, EventItem, Integration, Metrics } from "../types/operations";
+import type { AiStatus, AlertItem, CameraTestResult, DiscoveryResult, EventItem, Integration, IntegrationInput, Metrics } from "../types/operations";
 import type { LoginResponse, Share, User } from "../types/auth";
 
 const request = async <T>(path: string, options?: RequestInit): Promise<T> => {
-  const response = await fetch(path, { headers: { "Content-Type": "application/json", ...(options?.headers ?? {}) }, credentials: "include", ...options });
+  const headers = new Headers(options?.headers);
+  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  const response = await fetch(path, { ...options, headers, credentials: "include" });
   if (!response.ok) {
     const detail = (await response.json().catch(() => null))?.detail;
-    if (response.status === 502) throw new Error("LocalVision API is unavailable. Start the FastAPI backend on port 8000, then try again.");
-    throw new Error(typeof detail === "string" ? detail : `Request failed (${response.status})`);
+    if (response.status === 502 && !detail) throw new Error("LocalVision API is unavailable. Start the FastAPI backend on port 8000, then try again.");
+    throw new Error(typeof detail === "string" ? detail : detail ? JSON.stringify(detail) : `Request failed (${response.status})`);
   }
   return response.status === 204 ? (undefined as T) : response.json();
 };
@@ -25,7 +27,7 @@ export const cameraApi = {
   update: (id: number, input: Partial<CameraInput>) => request<Camera>(`/api/cameras/${id}`, { method: "PUT", body: JSON.stringify(input) }),
   remove: (id: number) => request<void>(`/api/cameras/${id}`, { method: "DELETE" }),
   test: (id: number) => request<CameraTestResult>(`/api/cameras/${id}/test`, { method: "POST" }),
-  testDraft: (input: CameraInput) => request<CameraTestResult>("/api/cameras/test", { method: "POST", body: JSON.stringify(input) }),
+  testDraft: (input: CameraInput, cameraId?: number) => request<CameraTestResult>(cameraId ? `/api/cameras/${cameraId}/test-draft` : "/api/cameras/test", { method: "POST", body: JSON.stringify(input) }),
   status: (id: number) => request<{ camera_id: number; status: string; protocol: string; resolution?: string | null; fps?: number | null; message?: string | null }>(`/api/cameras/${id}/status`),
   snapshot: (id: number) => request<{ camera_id: number; status: string; path?: string; url?: string; message?: string }>(`/api/cameras/${id}/snapshot`),
   previewUrl: (id: number) => `/api/cameras/${id}/preview.jpg?t=${Date.now()}`,
@@ -71,6 +73,8 @@ export const monitoringApi = { metrics: () => request<Metrics>("/api/metrics") }
 
 export const integrationApi = {
   list: () => request<Integration[]>("/api/integrations"),
+  create: (input: IntegrationInput) => request<Integration>("/api/integrations", { method: "POST", body: JSON.stringify(input) }),
+  remove: (id: number) => request<void>(`/api/integrations/${id}`, { method: "DELETE" }),
   test: (id: number) => request<{ ok: boolean; status_code?: number | null; error?: string | null }>(`/api/integrations/${id}/test`, { method: "POST" })
 };
 

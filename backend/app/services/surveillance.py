@@ -131,7 +131,7 @@ class SurveillanceWorker:
                 bags = [detection.label for detection in detections if detection.label in {"backpack", "handbag", "suitcase", "bag", "package", "parcel"}]
                 tracks = tracker.update(persons)
                 zones = await self._zones(camera.id)
-                relevant = [track for track in tracks if in_entrance_zone(track, zones)]
+                relevant = [track for track in tracks if in_entrance_zone(track, zones, frame.shape[1], frame.shape[0])]
                 if not relevant:
                     continue
                 description = await describe_activity(relevant, bags, reader.jpeg())

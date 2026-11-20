@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { AlertItem } from "../types/operations";
 import { operationsApi } from "../services/api";
 
-export function AlertsPage() {
+export function AlertsPage({ canWrite }: { canWrite: boolean }) {
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
   const [error, setError] = useState("");
 
@@ -31,7 +31,7 @@ export function AlertsPage() {
     <div className="alert-list">
       {alerts.map(alert => <article className={`alert-card ${alert.status}`} key={alert.id}>
         <div><span className="alert-level">{alert.kind}</span><h3>{alert.message}</h3><small>{new Date(alert.created_at).toLocaleString()} · {alert.status}</small></div>
-        {alert.status === "open" && <button onClick={() => void acknowledge(alert.id)}>Acknowledge</button>}
+        {alert.status === "open" && <button disabled={!canWrite} onClick={() => void acknowledge(alert.id)}>Acknowledge</button>}
       </article>)}
       {!alerts.length && <div className="empty-state">No alerts are available from the API.</div>}
     </div>

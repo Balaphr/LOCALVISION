@@ -32,6 +32,7 @@ async def ready() -> dict[str, str]:
 
 
 @router.get("/metrics")
+@router.get("/api/metrics")
 async def metrics() -> dict[str, object]:
     return snapshot()
 

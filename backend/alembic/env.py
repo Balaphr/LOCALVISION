@@ -7,8 +7,8 @@ from sqlalchemy import create_engine, pool
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import get_settings
+from app import models  # noqa: F401
 from app.database import Base
-from app.models import Camera, Role, Session, User  # noqa: F401
 
 config = context.config
 if config.config_file_name:

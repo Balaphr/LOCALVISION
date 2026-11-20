@@ -39,6 +39,15 @@ export interface Integration {
   created_at: string;
 }
 
+export interface IntegrationInput {
+  name: string;
+  kind: string;
+  endpoint: string;
+  auth_method: string;
+  secret?: string;
+  enabled: boolean;
+}
+
 export interface AlertItem {
   id: number;
   kind: string;

@@ -95,7 +95,7 @@ async def import_cameras(
 
 
 @router.post("/test", response_model=CameraTestResult)
-async def test_camera_draft(payload: CameraCreate, _: User = Depends(require_minimum_role("operator"))) -> CameraTestResult:
+async def test_new_camera_draft(payload: CameraCreate, _: User = Depends(require_minimum_role("operator"))) -> CameraTestResult:
     draft = Camera(**payload.model_dump(exclude={"password"}), encrypted_password=encrypt_secret(payload.password))
     result = await probe_camera(draft)
     return CameraTestResult(status=result.status, message=result.message, resolution=result.resolution, fps=result.fps, preview=result.preview, hints=None if result.status == "reachable" else result.message)
@@ -149,6 +149,16 @@ async def delete_camera(camera_id: int, request: Request, user: User = Depends(r
 async def test_camera(camera_id: int, _: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> CameraTestResult:
     camera = await get_camera(camera_id, db)
     result = await probe_camera(camera)
+    return CameraTestResult(camera_id=camera.id, status=result.status, message=result.message, resolution=result.resolution, fps=result.fps, preview=result.preview, hints=None if result.status == "reachable" else result.message)
+
+
+@router.post("/{camera_id}/test-draft", response_model=CameraTestResult)
+async def test_camera_draft(camera_id: int, payload: CameraCreate, _: User = Depends(require_minimum_role("operator")), db: AsyncSession = Depends(get_db)) -> CameraTestResult:
+    camera = await get_camera(camera_id, db)
+    data = payload.model_dump(exclude={"password"})
+    encrypted_password = camera.encrypted_password if not payload.password and payload.username == camera.username else encrypt_secret(payload.password)
+    draft = Camera(**data, encrypted_password=encrypted_password)
+    result = await probe_camera(draft)
     return CameraTestResult(camera_id=camera.id, status=result.status, message=result.message, resolution=result.resolution, fps=result.fps, preview=result.preview, hints=None if result.status == "reachable" else result.message)
 
 

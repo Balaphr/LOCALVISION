@@ -38,6 +38,7 @@ class LocalStorage:
             return str(path)
 
     def usage(self) -> StorageUsage:
+        self.prepare()
         total, used, free = shutil.disk_usage(self.root)
         return StorageUsage(total, used, free)
 

@@ -96,7 +96,7 @@ export function CameraForm({ camera, onSave, onCancel }: Props) {
     setError("");
     setTest(null);
     try {
-      const result = camera ? await cameraApi.test(camera.id) : await cameraApi.testDraft(form);
+      const result = await cameraApi.testDraft(form, camera?.id);
       setTest(result);
       if (result.status !== "reachable") setError(result.hints ?? result.message);
     } catch (reason) {

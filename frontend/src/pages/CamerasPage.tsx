@@ -1,8 +1,8 @@
 import { useState } from "react";
 import type { Camera, CameraInput } from "../types/camera";
 import { CameraCard } from "../components/CameraCard";
-interface Props { cameras: Camera[]; onAdd: () => void; onEdit: (camera: Camera) => void; onDelete: (camera: Camera) => void; onTest: (camera: Camera) => void; onImport: (endpoint: string, apiKey: string) => Promise<{ imported: number; skipped: number }>; }
-export function CamerasPage({ cameras, onAdd, onEdit, onDelete, onTest, onImport }: Props) {
+interface Props { cameras: Camera[]; canWrite: boolean; onAdd: () => void; onEdit: (camera: Camera) => void; onDelete: (camera: Camera) => void; onTest: (camera: Camera) => void; onImport: (endpoint: string, apiKey: string) => Promise<{ imported: number; skipped: number }>; }
+export function CamerasPage({ cameras, canWrite, onAdd, onEdit, onDelete, onTest, onImport }: Props) {
   const [importOpen, setImportOpen] = useState(false);
   const [endpoint, setEndpoint] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -30,9 +30,9 @@ export function CamerasPage({ cameras, onAdd, onEdit, onDelete, onTest, onImport
   return <>
     <div className="page-heading">
       <div><span className="eyebrow">Camera manager</span><h1>Your cameras</h1><p>Manage local connections without exposing camera credentials.</p></div>
-      <div className="camera-page-actions"><button className="api-import-button" onClick={() => setImportOpen(true)}>Import from API</button><button className="primary" onClick={onAdd}>＋ Add camera</button></div>
+      <div className="camera-page-actions">{canWrite && <button className="api-import-button" onClick={() => setImportOpen(true)}>Import from API</button>}<button className="primary" disabled={!canWrite} onClick={onAdd}>＋ Add camera</button></div>
     </div>
-    <div className="camera-grid">{cameras.map(camera => <CameraCard key={camera.id} camera={camera} onEdit={onEdit} onDelete={onDelete} onTest={onTest} />)}{!cameras.length && <div className="empty-state">No cameras configured yet.<br /><button className="primary" onClick={onAdd}>Add your first camera</button></div>}</div>
+    <div className="camera-grid">{cameras.map(camera => <CameraCard key={camera.id} camera={camera} canWrite={canWrite} onEdit={onEdit} onDelete={onDelete} onTest={onTest} />)}{!cameras.length && <div className="empty-state">No cameras configured yet.<br /><button className="primary" disabled={!canWrite} onClick={onAdd}>Add your first camera</button></div>}</div>
     {importOpen && <div className="modal-backdrop"><form className="camera-form" onSubmit={submitImport}>
       <div className="form-heading"><div><span className="eyebrow">Camera manager</span><h2>Import cameras from API</h2></div><button type="button" className="close-button" onClick={closeImport}>×</button></div>
       <p className="api-import-help">The endpoint must accept a GET request with the key in the X-API-Key header and return a JSON array of cameras. Each camera needs a name and host; optional fields follow the manual camera form. The key is not stored.</p>

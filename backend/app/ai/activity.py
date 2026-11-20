@@ -4,8 +4,8 @@ from typing import Any
 
 import httpx
 
-from ..config import get_settings
 from ..ai.tracking import Track
+from ..config import get_settings
 
 BAG_LABELS = {"backpack", "handbag", "suitcase", "bag", "package", "parcel"}
 ALLOWED_ACTIVITIES = [
@@ -22,44 +22,111 @@ ALLOWED_ACTIVITIES = [
     "Multiple people detected.",
 ]
 
+Point = tuple[float, float]
 
-def point_in_polygon(point: tuple[float, float], points: list[Any]) -> bool:
-    if len(points) < 3:
+
+def _normalize_points(value: Any) -> list[Point]:
+    points: list[Point] = []
+    for item in value or []:
+        try:
+            if isinstance(item, dict):
+                point = (float(item["x"]), float(item["y"]))
+            else:
+                point = (float(item[0]), float(item[1]))
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        points.append(point)
+    return points
+
+
+def point_in_polygon(point: Point, points: list[Any]) -> bool:
+    polygon = _normalize_points(points)
+    if len(polygon) < 3:
         return False
     x, y = point
     inside = False
-    index = 0
-    previous = len(points) - 1
-    while index < len(points):
-        current = points[index]
-        previous_point = points[previous]
-        try:
-            x1, y1 = float(current["x"]), float(current["y"])
-            x2, y2 = float(previous_point["x"]), float(previous_point["y"])
-        except (KeyError, TypeError, ValueError):
-            index += 1
-            previous = index - 1
-            continue
+    previous = polygon[-1]
+    for current in polygon:
+        x1, y1 = current
+        x2, y2 = previous
         if ((y1 > y) != (y2 > y)) and x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
             inside = not inside
-        previous = index
-        index += 1
+        previous = current
     return inside
 
 
-def in_entrance_zone(track: Track, zones: list[Any]) -> bool:
+def _distance_to_segment(point: Point, start: Point, end: Point) -> float:
+    px, py = point
+    x1, y1 = start
+    x2, y2 = end
+    dx = x2 - x1
+    dy = y2 - y1
+    length_squared = dx * dx + dy * dy
+    if length_squared == 0:
+        return ((px - x1) ** 2 + (py - y1) ** 2) ** 0.5
+    ratio = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / length_squared))
+    closest_x = x1 + ratio * dx
+    closest_y = y1 + ratio * dy
+    return ((px - closest_x) ** 2 + (py - closest_y) ** 2) ** 0.5
+
+
+def _cross_product(start: Point, end: Point, point: Point) -> float:
+    return (end[0] - start[0]) * (point[1] - start[1]) - (end[1] - start[1]) * (point[0] - start[0])
+
+
+def _segments_intersect(first_start: Point, first_end: Point, second_start: Point, second_end: Point) -> bool:
+    first_side = _cross_product(second_start, second_end, first_start)
+    second_side = _cross_product(second_start, second_end, first_end)
+    third_side = _cross_product(first_start, first_end, second_start)
+    fourth_side = _cross_product(first_start, first_end, second_end)
+    return ((first_side > 0 and second_side < 0) or (first_side < 0 and second_side > 0)) and ((third_side > 0 and fourth_side < 0) or (third_side < 0 and fourth_side > 0))
+
+
+def _line_crossed(track: Track, points: list[Any], frame_width: int, frame_height: int) -> bool:
+    line = _normalize_points(points)
+    if len(line) < 2:
+        return False
+    width = max(frame_width, 1)
+    height = max(frame_height, 1)
+    history: list[Point] = []
+    for item in track.history[-8:]:
+        try:
+            history.append((float(item["x"]) / width, float(item["y"]) / height))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not history:
+        history.append((track.center[0] / width, track.center[1] / height))
+    for index in range(1, len(history)):
+        for segment_index in range(1, len(line)):
+            if _segments_intersect(history[index - 1], history[index], line[segment_index - 1], line[segment_index]):
+                return True
+    center = history[-1]
+    return any(_distance_to_segment(center, line[index - 1], line[index]) <= 0.02 for index in range(1, len(line)))
+
+
+def in_entrance_zone(track: Track, zones: list[Any], frame_width: int = 0, frame_height: int = 0) -> bool:
     if not zones:
-        center_x, center_y = track.center
-        return 0.15 < center_x < 0.85 and center_y > 0.45 if center_x <= 1 and center_y <= 1 else True
+        return True
+    width = max(frame_width, 1)
+    height = max(frame_height, 1)
+    center = (track.center[0] / width, track.center[1] / height)
     for zone in zones:
         if not getattr(zone, "enabled", True):
-            continue
-        if getattr(zone, "zone_type", "detection") in {"ignore", "restricted"} and getattr(zone, "zone_type", "") != "detection":
             continue
         filters = getattr(zone, "object_filters", None) or []
         if filters and "person" not in filters:
             continue
-        if point_in_polygon(track.center, getattr(zone, "points", []) or []):
+        zone_type = getattr(zone, "zone_type", "detection")
+        points = getattr(zone, "points", []) or []
+        if zone_type == "ignore":
+            if point_in_polygon(center, points):
+                return False
+            continue
+        if zone_type == "line":
+            if _line_crossed(track, points, width, height):
+                return True
+            continue
+        if point_in_polygon(center, points):
             return True
     return False
 

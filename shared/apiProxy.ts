@@ -25,20 +25,23 @@ export async function proxyApiRequest(request: Request, env: ProxyEnv): Promise<
   const target = new URL(`${incoming.pathname}${incoming.search}`, origin);
   const headers = new Headers(request.headers);
   headers.delete("host");
-  headers.delete("cf-connecting-ip");
   headers.delete("cf-ray");
+  const clientIp = headers.get("cf-connecting-ip");
+  if (clientIp) headers.set("x-forwarded-for", clientIp);
 
   const method = request.method.toUpperCase();
-  const body = method === "GET" || method === "HEAD" ? undefined : request.body;
+  if (headers.get("upgrade")?.toLowerCase() === "websocket") {
+    try {
+      return await fetch(target.toString(), { method, headers, redirect: "manual" });
+    } catch {
+      return unavailable("LocalVision realtime service is unreachable. Check the FastAPI backend and BACKEND_ORIGIN.");
+    }
+  }
 
+  const body = method === "GET" || method === "HEAD" ? undefined : request.body;
   let response: Response;
   try {
-    response = await fetch(target.toString(), {
-      method,
-      headers,
-      body,
-      redirect: "manual"
-    });
+    response = await fetch(target.toString(), { method, headers, body, redirect: "manual" });
   } catch {
     return unavailable("LocalVision API is unreachable. Check the FastAPI backend and BACKEND_ORIGIN.");
   }

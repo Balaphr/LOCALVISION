@@ -70,4 +70,4 @@ async def media_file(relative_path: str, _: User = Depends(require_minimum_role(
         raise HTTPException(status_code=404, detail="Media file not found")
     suffix = path.suffix.lower()
     media_type = "image/jpeg" if suffix in {".jpg", ".jpeg"} else "video/mp4" if suffix == ".mp4" else "application/octet-stream"
-    return FileResponse(path, media_type=media_type, filename=path.name)
+    return FileResponse(path, media_type=media_type, content_disposition_type="inline")

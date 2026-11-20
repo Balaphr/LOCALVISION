@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     secret_key: str = ""
     encryption_key: str = ""
     cookie_secure: bool | None = None
-    cors_origins: str = "http://localhost:5173"
+    cors_origins: str = "http://localhost:5173,https://balasoftware.in"
     storage_path: Path = Path("storage")
     session_hours: int = 24
     ffmpeg_bin: str = "ffmpeg"

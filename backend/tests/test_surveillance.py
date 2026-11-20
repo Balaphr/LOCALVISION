@@ -1,11 +1,12 @@
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.ai.activity import rule_based_description
+from app.ai.activity import in_entrance_zone, rule_based_description
 from app.ai.base import Detection
 from app.ai.tracking import Tracker, Track
 from app.auth.security import encrypt_secret, hash_password
@@ -70,6 +71,23 @@ def test_tracker_preserves_identity_and_activity_descriptions():
     assert rule_based_description([approaching, Track(2, "person", (0, 0, 10, 10), 0.8)], []) == "Multiple people detected."
 
 
+def test_zone_detection_uses_normalized_points():
+    track = Track(1, "person", (40, 40, 60, 60), 0.9)
+    zone = SimpleNamespace(enabled=True, zone_type="detection", points=[[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]], object_filters=["person"])
+    assert in_entrance_zone(track, [zone], 100, 100)
+    outside = SimpleNamespace(enabled=True, zone_type="detection", points=[[0.7, 0.7], [0.9, 0.7], [0.9, 0.9], [0.7, 0.9]], object_filters=["person"])
+    assert not in_entrance_zone(track, [outside], 100, 100)
+
+
+def test_zone_ignore_and_line_crossing():
+    track = Track(1, "person", (40, 40, 60, 60), 0.9)
+    ignore = SimpleNamespace(enabled=True, zone_type="ignore", points=[[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]], object_filters=["person"])
+    assert not in_entrance_zone(track, [ignore], 100, 100)
+    track.history = [{"x": 30, "y": 50, "area": 400, "at": 0}, {"x": 70, "y": 50, "area": 400, "at": 1}]
+    line = SimpleNamespace(enabled=True, zone_type="line", points=[[0.5, 0], [0.5, 1]], object_filters=["person"])
+    assert in_entrance_zone(track, [line], 100, 100)
+
+
 @pytest.mark.asyncio
 async def test_events_search_and_alert_acknowledge(client, database):
     await login(client, database)
@@ -88,3 +106,13 @@ async def test_events_search_and_alert_acknowledge(client, database):
     alert_id = alerts.json()[0]["id"]
     updated = await client.patch(f"/api/alerts/{alert_id}")
     assert updated.json()["status"] == "acknowledged"
+
+
+@pytest.mark.asyncio
+async def test_metrics_alias_and_invalid_event_date(client, database):
+    await login(client, database)
+    metrics = await client.get("/api/metrics")
+    assert metrics.status_code == 200
+    assert metrics.json()["api"] == "ok"
+    invalid = await client.get("/api/events?start=not-a-timestamp")
+    assert invalid.status_code == 422

@@ -12,6 +12,13 @@ from ..models.auth import User
 router = APIRouter(tags=["operations"])
 
 
+def parse_datetime(value: str, field: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=f"Invalid {field} timestamp") from error
+
+
 def recording_json(recording: Recording) -> dict[str, object]:
     return {"id": recording.id, "camera_id": recording.camera_id, "path": recording.path, "started_at": recording.started_at, "ended_at": recording.ended_at, "duration_seconds": recording.duration_seconds, "size_bytes": recording.size_bytes, "kind": recording.kind, "status": recording.status}
 
@@ -26,7 +33,7 @@ def event_json(event: Event) -> dict[str, object]:
 async def recordings(_: User = Depends(require_minimum_role("viewer")), page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), camera_id: int | None = None, date: str | None = None, db: AsyncSession = Depends(get_db)) -> dict[str, object]:
     query = select(Recording).order_by(Recording.started_at.desc()).offset((page - 1) * page_size).limit(page_size)
     if camera_id is not None: query = query.where(Recording.camera_id == camera_id)
-    if date: query = query.where(Recording.started_at >= datetime.fromisoformat(date))
+    if date: query = query.where(Recording.started_at >= parse_datetime(date, "date"))
     result = await db.execute(query)
     return {"items": [recording_json(recording) for recording in result.scalars()], "page": page, "page_size": page_size}
 
@@ -43,7 +50,7 @@ async def recording_file(recording_id: int, _: User = Depends(require_minimum_ro
     if not recording: raise HTTPException(status_code=404, detail="Recording not found")
     path = (LocalStorage().root / recording.path).resolve()
     if not path.is_relative_to(LocalStorage().root.resolve()) or not path.is_file(): raise HTTPException(status_code=404, detail="Recording file not found")
-    return FileResponse(path, media_type="video/mp4", filename=path.name)
+    return FileResponse(path, media_type="video/mp4", content_disposition_type="inline")
 
 
 @router.delete("/api/recordings/{recording_id}", status_code=204)
@@ -77,9 +84,9 @@ def _filtered_events(
     if kind:
         query = query.where(Event.kind.ilike(f"%{kind}%"))
     if start:
-        query = query.where(Event.occurred_at >= datetime.fromisoformat(start))
+        query = query.where(Event.occurred_at >= parse_datetime(start, "start"))
     if end:
-        query = query.where(Event.occurred_at <= datetime.fromisoformat(end))
+        query = query.where(Event.occurred_at <= parse_datetime(end, "end"))
     if min_confidence is not None:
         query = query.where(Event.confidence >= min_confidence)
     return query

@@ -25,9 +25,8 @@ rate_windows: dict[str, deque[float]] = defaultdict(deque)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    if settings.environment == "development":
-        async with engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
     LocalStorage().prepare()
     await ensure_surveillance_columns(engine)
     if settings.surveillance_worker_enabled:
@@ -52,10 +51,11 @@ app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allo
 async def security_headers(request: Request, call_next):
     if request.url.path.endswith("/login"):
         now = time.monotonic()
-        key = request.client.host if request.client else "unknown"
+        forwarded = request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        key = forwarded or (request.client.host if request.client else "unknown")
         window = rate_windows[key]
         while window and now - window[0] > 60: window.popleft()
-        if len(window) >= 20:
+        if len(window) >= 60:
             return JSONResponse(status_code=429, content={"detail": "Too many login attempts"})
         window.append(now)
     response = await call_next(request)
