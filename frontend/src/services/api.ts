@@ -2,7 +2,7 @@ import type { Camera, CameraInput } from "../types/camera";
 import type { RecordingPage, Zone, ZoneInput } from "../types/recording";
 import type { AiStatus, AlertItem, DiscoveryResult, EventItem, Integration, IntegrationInput, Metrics } from "../types/operations";
 import type { LoginResponse, Role, Share, User, UserRecord } from "../types/auth";
-import type { StorageIntegration, StorageIntegrationInput, StorageOverview, StorageProbe } from "../types/storage";
+import type { StorageIntegration, StorageIntegrationInput, StorageOverview, StorageProbe, StorageRecording } from "../types/storage";
 
 const request = async <T>(path: string, options?: RequestInit): Promise<T> => {
   const headers = new Headers(options?.headers);
@@ -100,7 +100,8 @@ export const storageApi = {
   create: (input: StorageIntegrationInput) => request<StorageIntegration>("/api/storage/servers", { method: "POST", body: JSON.stringify(input) }),
   update: (id: number, input: Partial<StorageIntegrationInput>) => request<StorageIntegration>(`/api/storage/servers/${id}`, { method: "PATCH", body: JSON.stringify(input) }),
   remove: (id: number) => request<void>(`/api/storage/servers/${id}`, { method: "DELETE" }),
-  test: (id: number) => request<StorageProbe>(`/api/storage/servers/${id}/test`, { method: "POST" })
+  test: (id: number) => request<StorageProbe>(`/api/storage/servers/${id}/test`, { method: "POST" }),
+  recordings: (id: number) => request<StorageRecording[]>(`/api/storage/servers/${id}/recordings`)
 };
 
 export const settingsApi = { get: () => request<{ version: string; environment: string; storage_path: string; secrets_configured: boolean }>("/api/settings") };

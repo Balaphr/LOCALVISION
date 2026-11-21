@@ -1,5 +1,5 @@
 import { all, first, run, parseJson } from "./db";
-import { hashPassword, verifyPassword, randomToken, encryptSecret } from "./crypto";
+import { hashPassword, verifyPassword, randomToken, encryptSecret, decryptSecret } from "./crypto";
 
 declare const WebSocketPair: any;
 
@@ -689,78 +689,334 @@ const usersRoute = async (request: Request, env: Env, parts: string[], method: s
   return fail("Not found", 404);
 };
 
-const storageServersRoute = async (request: Request, env: Env, parts: string[], method: string): Promise<Response> => {
+const storageBaseUrl = (endpoint: string): string => {
+  const url = new URL(endpoint);
+  let pathname = url.pathname.replace(/\/+$/, "");
+  const known = ["/api/storage/overview", "/api/storage", "/api"];
+  for (const suffix of known) {
+    if (pathname.endsWith(suffix)) {
+      pathname = pathname.slice(0, -suffix.length);
+      break;
+    }
+  }
+  url.pathname = pathname;
+  url.search = "";
+  url.hash = "";
+  return url.toString().replace(/\/$/, "");
+};
+
+const storageNumber = (value: any): number | null => {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+};
+
+const parseStorageUsage = (payload: any) => {
+  let value = payload;
+  for (let index = 0; index < 4 && value && typeof value === "object"; index += 1) {
+    const nested = value.data ?? value.result ?? value.storage ?? value.usage;
+    if (!nested || typeof nested !== "object" || nested === value) break;
+    value = nested;
+  }
+  const pick = (keys: string[]) => {
+    for (const key of keys) {
+      const number = storageNumber(value?.[key]);
+      if (number !== null) return number;
+    }
+    return null;
+  };
+  let total = pick(["total_bytes", "capacity_bytes", "total", "capacity"]);
+  let used = pick(["used_bytes", "used", "used_space"]);
+  let available = pick(["free_bytes", "available_bytes", "free", "available"]);
+  if (total !== null && used !== null && available === null) available = Math.max(0, total - used);
+  if (total !== null && available !== null && used === null) used = Math.max(0, total - available);
+  if (used !== null && available !== null && total === null) total = used + available;
+  const usage = {
+    total_bytes: total ?? 0,
+    used_bytes: used ?? 0,
+    available_bytes: available ?? 0,
+    percent_used: total && used ? Math.round((used / total) * 1000) / 10 : 0,
+    source: "ubuntu-storage"
+  };
+  const raw = value?.cameras ?? value?.camera_usage ?? value?.per_camera ?? {};
+  const cameras: any[] = [];
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const cameraId = Number(item?.camera_id ?? item?.id);
+      const usedBytes = storageNumber(item?.used_bytes ?? item?.used ?? item?.bytes) ?? 0;
+      if (!Number.isFinite(cameraId)) continue;
+      cameras.push({ camera_id: cameraId, used_bytes: usedBytes, status: String(item?.status ?? "online") });
+    }
+  } else if (raw && typeof raw === "object") {
+    for (const [key, item] of Object.entries(raw)) {
+      const cameraId = Number(key);
+      const usedBytes = typeof item === "number" ? item : storageNumber((item as any)?.used_bytes ?? (item as any)?.used ?? (item as any)?.bytes) ?? 0;
+      if (!Number.isFinite(cameraId)) continue;
+      cameras.push({ camera_id: cameraId, used_bytes: usedBytes, status: String((item as any)?.status ?? "online") });
+    }
+  }
+  return { usage, cameras };
+};
+
+const storageFetch = async (env: Env, item: any, subPath: string, init: RequestInit = {}): Promise<Response> => {
+  const endpoint = String(item.endpoint ?? "").trim();
+  if (!/^https?:\/\/\S+$/i.test(endpoint)) throw new Error("Storage API URL is missing or invalid");
+  const target = new URL(subPath.replace(/^\/+/, ""), `${storageBaseUrl(endpoint)}/`);
+  const secret = await decryptSecret(item.secret_enc, env.ENCRYPTION_KEY || env.SECRET_KEY);
+  const headers = new Headers(init.headers || {});
+  if (!headers.has("Accept")) headers.set("Accept", "application/json");
+  if (secret) {
+    if (item.auth_method === "bearer") headers.set("Authorization", `Bearer ${secret}`);
+    else if (item.auth_method === "basic") headers.set("Authorization", `Basic ${secret}`);
+    else headers.set("X-API-Key", secret);
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    return await fetch(target.toString(), { ...init, headers, signal: controller.signal, redirect: "follow" });
+  } catch (error: any) {
+    throw new Error(`Could not reach storage API: ${error?.message || "unknown error"}`);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const probeStorage = async (env: Env, item: any, persist = false) => {
+  const checkedAt = stamp();
+  try {
+    const response = await storageFetch(env, item, "api/storage/overview");
+    const text = await response.text();
+    const snippet = (value: string) => (value.length > 500 ? `${value.slice(0, 500)}…` : value);
+    if (!response.ok) {
+      const message = response.status === 403 && /error code:\s*1003|direct ip access not allowed/i.test(text)
+        ? "Storage API rejected a direct IP request (error code 1003). Use a domain name instead of an IP address."
+        : `Storage API returned HTTP ${response.status}: ${snippet(text)}`;
+      if (persist) await run(env.DB, "UPDATE storage_servers SET last_status=?,last_error=?,last_checked_at=? WHERE id=?", "error", message, checkedAt, item.id);
+      return { status: "error", message, usage: null, cameras: [], checked_at: checkedAt };
+    }
+    let payload: any;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      const message = "Storage API did not return valid JSON";
+      if (persist) await run(env.DB, "UPDATE storage_servers SET last_status=?,last_error=?,last_checked_at=? WHERE id=?", "error", message, checkedAt, item.id);
+      return { status: "error", message, usage: null, cameras: [], checked_at: checkedAt };
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      const message = "Storage API must return a JSON object";
+      if (persist) await run(env.DB, "UPDATE storage_servers SET last_status=?,last_error=?,last_checked_at=? WHERE id=?", "error", message, checkedAt, item.id);
+      return { status: "error", message, usage: null, cameras: [], checked_at: checkedAt };
+    }
+    const parsed = parseStorageUsage(payload);
+    const status = parsed.usage.total_bytes > 0 ? "online" : "warning";
+    const message = status === "online" ? "Connected" : "Connected, but no capacity data was reported";
+    if (persist) await run(env.DB, "UPDATE storage_servers SET last_status=?,last_error=?,last_checked_at=? WHERE id=?", status, status === "online" ? null : message, checkedAt, item.id);
+    return { status, message, usage: parsed.usage, cameras: parsed.cameras, checked_at: checkedAt };
+  } catch (error: any) {
+    const message = error?.message || "Storage connection failed";
+    if (persist) await run(env.DB, "UPDATE storage_servers SET last_status=?,last_error=?,last_checked_at=? WHERE id=?", "offline", message, checkedAt, item.id);
+    return { status: "offline", message, usage: null, cameras: [], checked_at: checkedAt };
+  }
+};
+
+const normalizeRecording = (entry: any) => ({
+  id: String(entry?.id ?? entry?.file_id ?? ""),
+  camera_id: Number(entry?.camera_id ?? entry?.camera ?? 0) || null,
+  name: String(entry?.name ?? entry?.filename ?? entry?.path ?? "Recording"),
+  path: String(entry?.path ?? ""),
+  size_bytes: Number(entry?.size_bytes ?? entry?.size ?? 0) || 0,
+  created_at: entry?.created_at ?? entry?.mtime ?? null,
+  duration_seconds: entry?.duration_seconds ?? entry?.duration ?? null,
+  mime_type: String(entry?.mime_type ?? "video/mp4")
+});
+
+const storageServersRoute = async (request: Request, env: Env, parts: string[], method: string, user: any): Promise<Response> => {
   const db = env.DB;
-  if (parts.length === 4) {
+  if (parts.length === 3) {
     if (method === "GET") return json((await all(db, "SELECT * FROM storage_servers ORDER BY id")).map(storageView));
     if (method === "POST") {
       const data = await bodyOf(request);
+      const endpointRaw = String(data.endpoint ?? "").trim();
+      const apiKey = String(data.api_key ?? data.secret ?? "");
+      if (!/^https?:\/\/\S+$/i.test(endpointRaw)) return fail("Enter a valid http or https storage API URL", 422);
+      if (!apiKey) return fail("API key is required", 422);
+      if (apiKey.length > 500) return fail("API key is too long", 422);
+      const endpoint = storageBaseUrl(endpointRaw);
       await run(
         db,
         "INSERT INTO storage_servers (name,kind,endpoint,base_path,bucket,region,auth_method,secret_enc,enabled,last_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        String(data.name ?? ""),
-        String(data.kind ?? "local_mount"),
-        String(data.endpoint ?? ""),
-        data.base_path || null,
-        data.bucket || null,
-        data.region || null,
-        String(data.auth_method ?? "none"),
-        await encryptSecret(data.secret || null, env.ENCRYPTION_KEY || env.SECRET_KEY),
+        String(data.name ?? "").trim() || "Ubuntu Storage",
+        "remote_api",
+        endpoint,
+        null,
+        null,
+        null,
+        "api_key",
+        await encryptSecret(apiKey, env.ENCRYPTION_KEY || env.SECRET_KEY),
         data.enabled === false ? 0 : 1,
         "unknown",
         stamp(),
         stamp()
       );
-      return json(storageView(await first(db, "SELECT * FROM storage_servers ORDER BY id DESC LIMIT 1")), 201);
+      const created = await first(db, "SELECT * FROM storage_servers ORDER BY id DESC LIMIT 1");
+      const probe = await probeStorage(env, created, true);
+      await audit(request, env, user, "storage.created", String(created.id));
+      return json({ ...storageView(created), probe }, 201);
     }
   }
-  const id = Number(parts[4]);
+  const id = Number(parts[3]);
   const item = await first(db, "SELECT * FROM storage_servers WHERE id=?", id);
   if (!item) return fail("Storage server not found", 404);
-  if (parts[5] === "test" && method === "POST") {
-    const checkedAt = stamp();
-    await run(db, "UPDATE storage_servers SET last_status=?, last_error=?, last_checked_at=? WHERE id=?", "unreachable", "Storage probing requires a local service.", checkedAt, id);
-    return json({ status: "unreachable", message: "Storage probing requires a local service.", usage: null, checked_at: checkedAt });
+
+  if (parts[4] === "test" && method === "POST") {
+    const probe = await probeStorage(env, item, true);
+    await audit(request, env, user, "storage.tested", String(id));
+    return json(probe);
   }
-  if (parts.length === 5 && method === "PATCH") {
+
+  if (parts[4] === "recordings" && method === "GET" && !parts[5]) {
+    try {
+      const response = await storageFetch(env, item, "api/recordings");
+      const text = await response.text();
+      if (!response.ok) return fail(`Storage API returned HTTP ${response.status}: ${text.slice(0, 500)}`, 502);
+      let payload: any;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        return fail("Storage API did not return valid recording JSON", 502);
+      }
+      const items = Array.isArray(payload) ? payload : payload.files ?? payload.recordings ?? payload.data ?? [];
+      if (!Array.isArray(items)) return fail("Storage API recording list must be an array", 502);
+      return json(items.map(normalizeRecording).filter((entry: any) => entry.id));
+    } catch (error: any) {
+      return fail(error?.message || "Could not load recordings", 502);
+    }
+  }
+
+  if (parts[4] === "recordings" && parts[5] && ["file", "download"].includes(parts[6]) && method === "GET") {
+    const subPath = `api/recordings/${encodeURIComponent(parts[5])}/${parts[6]}`;
+    const range = request.headers.get("range");
+    try {
+      const response = await storageFetch(env, item, subPath, { headers: range ? { Range: range } : {} });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        return fail(`Storage API returned HTTP ${response.status}: ${detail.slice(0, 500)}`, 502);
+      }
+      const headers: Record<string, string> = { "cache-control": "no-store" };
+      for (const key of ["content-type", "content-length", "content-range", "accept-ranges", "content-disposition"]) {
+        const value = response.headers.get(key);
+        if (value) headers[key] = value;
+      }
+      return new Response(response.body, { status: response.status, headers });
+    } catch (error: any) {
+      return fail(error?.message || "Could not stream recording", 502);
+    }
+  }
+
+  if (parts.length === 4 && method === "PATCH") {
     const data = await bodyOf(request);
     const fields: Record<string, any> = {};
-    for (const key of ["name", "kind", "endpoint", "base_path", "bucket", "region", "auth_method"]) {
-      if (key in data) fields[key] = data[key];
+    if ("name" in data) fields.name = String(data.name);
+    if ("endpoint" in data) {
+      const endpoint = String(data.endpoint ?? "").trim();
+      if (!/^https?:\/\/\S+$/i.test(endpoint)) return fail("Enter a valid http or https storage API URL", 422);
+      fields.endpoint = storageBaseUrl(endpoint);
     }
     if ("enabled" in data) fields.enabled = data.enabled ? 1 : 0;
-    if (data.secret) fields.secret_enc = await encryptSecret(String(data.secret), env.ENCRYPTION_KEY || env.SECRET_KEY);
+    const apiKey = String(data.api_key ?? data.secret ?? "");
+    if (apiKey) {
+      if (apiKey.length > 500) return fail("API key is too long", 422);
+      fields.secret_enc = await encryptSecret(apiKey, env.ENCRYPTION_KEY || env.SECRET_KEY);
+    }
+    fields.last_status = "unknown";
     const keys = Object.keys(fields);
     if (keys.length) await run(db, `UPDATE storage_servers SET ${keys.map((key) => `${key}=?`).join(",")}, updated_at=? WHERE id=?`, ...keys.map((key) => fields[key]), stamp(), id);
     return json(storageView(await first(db, "SELECT * FROM storage_servers WHERE id=?", id)));
   }
-  if (parts.length === 5 && method === "DELETE") {
+  if (parts.length === 4 && method === "DELETE") {
     await run(db, "DELETE FROM storage_servers WHERE id=?", id);
+    await audit(request, env, user, "storage.deleted", String(id));
     return empty();
   }
   return fail("Not found", 404);
 };
 
 const storageOverview = async (env: Env): Promise<Response> => {
-  const servers = (await all(env.DB, "SELECT * FROM storage_servers ORDER BY id")).map(storageView);
+  const rows = await all(env.DB, "SELECT * FROM storage_servers ORDER BY id");
+  const servers: any[] = [];
+  const cameraUsage = new Map<number, any>();
+  const recordings: any[] = [];
+  const totals = { total_bytes: 0, used_bytes: 0, available_bytes: 0 };
+
+  for (const row of rows) {
+    const probe = row.enabled
+      ? await probeStorage(env, row)
+      : { status: "disabled", message: "Integration disabled", usage: null, cameras: [], checked_at: null };
+    servers.push({
+      ...storageView(row),
+      connection: probe.status === "online" || probe.status === "warning" ? "Connected" : "Disconnected",
+      probe
+    });
+    for (const item of probe.cameras) cameraUsage.set(Number(item.camera_id), item);
+    if (probe.usage) {
+      totals.total_bytes += probe.usage.total_bytes;
+      totals.used_bytes += probe.usage.used_bytes;
+      totals.available_bytes += probe.usage.available_bytes;
+    }
+    if (probe.status === "online" || probe.status === "warning") {
+      try {
+        const response = await storageFetch(env, row, "api/recordings");
+        if (response.ok) {
+          const payload: any = await response.json().catch(() => []);
+          const items = Array.isArray(payload) ? payload : payload.files ?? payload.recordings ?? payload.data ?? [];
+          if (Array.isArray(items)) {
+            for (const item of items) {
+              const recording = normalizeRecording(item);
+              recordings.push({ ...recording, server_id: row.id, server_name: row.name, fileUrl: `/api/storage/servers/${row.id}/recordings/${encodeURIComponent(recording.id)}/file`, downloadUrl: `/api/storage/servers/${row.id}/recordings/${encodeURIComponent(recording.id)}/download` });
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+
   const cameraRows = await all(env.DB, "SELECT id,name,protocol,enabled FROM cameras ORDER BY id");
-  return json({
-    local: zeroUsage("cloudflare-r2"),
-    servers,
-    cameras: cameraRows.map((camera) => ({
+  const recordingCounts = new Map<number, number>();
+  for (const recording of recordings) {
+    if (recording.camera_id) recordingCounts.set(recording.camera_id, (recordingCounts.get(recording.camera_id) ?? 0) + 1);
+  }
+  const cameras = cameraRows.map((camera) => {
+    const usage = cameraUsage.get(Number(camera.id));
+    return {
       id: camera.id,
       name: camera.name,
       status: camera.enabled ? "configured" : "disabled",
       protocol: camera.protocol,
       owner: null,
-      used_bytes: 0,
-      available_bytes: 0,
-      percent_used: 0
-    })),
-    totals: zeroUsage("cloudflare-r2"),
+      used_bytes: usage?.used_bytes ?? 0,
+      recording_count: recordingCounts.get(Number(camera.id)) ?? 0,
+      available_bytes: probeTotal(servers) - (usage?.used_bytes ?? 0),
+      percent_used: probeTotal(servers) ? Math.round(((usage?.used_bytes ?? 0) / probeTotal(servers)) * 1000) / 10 : 0
+    };
+  });
+
+  const combined = {
+    total_bytes: totals.total_bytes,
+    used_bytes: totals.used_bytes,
+    available_bytes: totals.available_bytes,
+    percent_used: totals.total_bytes ? Math.round((totals.used_bytes / totals.total_bytes) * 1000) / 10 : 0,
+    source: "ubuntu-storage"
+  };
+  return json({
+    local: zeroUsage("none"),
+    servers,
+    cameras,
+    recordings,
+    totals: combined,
     camera_count: cameraRows.length
   });
 };
+
+const probeTotal = (servers: any[]): number => servers.reduce((sum, server) => sum + (server.probe?.usage?.total_bytes ?? 0), 0);
 
 const route = async (request: Request, env: Env): Promise<Response> => {
   const url = new URL(request.url);
@@ -809,8 +1065,11 @@ const route = async (request: Request, env: Env): Promise<Response> => {
 
   if (parts[1] === "cameras") return camerasRoute(request, env, parts, method, user);
   if (parts[1] === "users") return usersRoute(request, env, parts, method, user);
-  if (parts[1] === "storage" && parts[2] === "servers") return storageServersRoute(request, env, parts, method);
-  if (path === "/api/storage/overview" && method === "GET") return storageOverview(env);
+  if (parts[1] === "storage") {
+    if (user.role !== "admin") return fail("Storage access restricted to administrators", 403);
+    if (parts[2] === "servers") return storageServersRoute(request, env, parts, method, user);
+    if ((path === "/api/storage/overview" || path === "/api/storage") && method === "GET") return storageOverview(env);
+  }
 
   if (parts[1] === "integrations") {
     if (parts.length === 2 && method === "GET") {
