@@ -64,21 +64,28 @@ const userView = (user: any) => ({
   created_at: user.created_at
 });
 
+const normalizeRtspUrl = (value: any): string => {
+  const raw = String(value ?? "").trim();
+  const match = raw.match(/^(?:https?:\/\/)?(rtsps?:\/\/\S+)$/i);
+  return match ? match[1] : raw;
+};
+
 const redactStreamUrl = (value: any): string | null => {
-  if (!value) return null;
+  const raw = normalizeRtspUrl(value);
+  if (!raw) return null;
   try {
-    const url = new URL(String(value));
+    const url = new URL(raw);
     if (url.username || url.password) {
       url.username = "";
       url.password = "";
       return url.toString();
     }
   } catch {}
-  return String(value);
+  return raw;
 };
 
 const splitCredentials = (value: any) => {
-  const raw = String(value ?? "").trim();
+  const raw = normalizeRtspUrl(value);
   if (!/^rtsps?:\/\//i.test(raw)) return { url: raw, username: "", password: "" };
   try {
     const url = new URL(raw);
@@ -138,7 +145,7 @@ const migrateCameraCredentials = (env: Env) => {
 let credentialMigrationPromise: Promise<void> | undefined;
 
 const cameraSource = async (env: Env, camera: any): Promise<string> => {
-  const value = String(camera.rtsp_url || camera.main_stream || "");
+  const value = normalizeRtspUrl(camera.rtsp_url || camera.main_stream || "");
   if (!/^rtsps?:\/\//i.test(value)) return value;
   const url = new URL(value);
   if (camera.username) {
