@@ -22,7 +22,6 @@ const queryString = (filters: object) =>
 export const cameraApi = {
   list: () => request<Camera[]>("/api/cameras"),
   create: (input: CameraInput) => request<Camera>("/api/cameras", { method: "POST", body: JSON.stringify(input) }),
-  importFromApi: (endpoint: string, apiKey: string) => request<{ imported: number; skipped: number }>("/api/cameras/import", { method: "POST", body: JSON.stringify({ endpoint, api_key: apiKey }) }),
   discover: () => request<DiscoveryResult[]>("/api/cameras/discover", { method: "POST" }),
   inspectOnvif: (endpoint: string, username?: string, password?: string) => request<DiscoveryResult>("/api/cameras/onvif/inspect", { method: "POST", body: JSON.stringify({ endpoint, username: username || null, password: password || null }) }),
   update: (id: number, input: Partial<CameraInput>) => request<Camera>(`/api/cameras/${id}`, { method: "PUT", body: JSON.stringify(input) }),

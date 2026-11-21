@@ -327,6 +327,9 @@ const importCamerasFromApi = async (request: Request, env: Env, user: any): Prom
   const rawText = await upstream.text();
   const snippet = (value: string) => (value.length > 500 ? `${value.slice(0, 500)}…` : value);
   if (!upstream.ok) {
+    if (upstream.status === 403 && /error code:\s*1003|direct ip access not allowed/i.test(rawText)) {
+      return fail(`Camera API rejected a direct IP request (HTTP 403, error code 1003). Use the camera API's domain name instead of an IP address: ${endpointRaw}`, 502);
+    }
     return fail(`Camera API returned HTTP ${upstream.status}: ${snippet(rawText)}`, 502);
   }
 
@@ -438,23 +441,25 @@ const camerasRoute = async (request: Request, env: Env, parts: string[], method:
     if (method === "GET") return json((await all(db, "SELECT * FROM cameras ORDER BY id")).map(cameraView));
     if (method === "POST") {
       const data = await bodyOf(request);
-      if (!String(data.name ?? "").trim() || !String(data.host ?? "").trim()) return fail("Name and host are required");
+      const host = String(data.host ?? "").trim();
+      if (!host) return fail("RTSP IP / host is required");
+      const name = String(data.name ?? "").trim() || `Camera ${host}`;
       const secret = env.ENCRYPTION_KEY || env.SECRET_KEY;
       await run(
         db,
         "INSERT INTO cameras (name,location,manufacturer,model,host,port,protocol,rtsp_url,onvif_url,username,password_enc,main_stream,sub_stream,enabled,recording_enabled,ai_enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        String(data.name).trim(),
+        name,
         String(data.location ?? ""),
         String(data.manufacturer ?? "Generic"),
         String(data.model ?? ""),
-        String(data.host).trim(),
+        host,
         Number(data.port ?? 554),
         String(data.protocol ?? "RTSP"),
         data.rtsp_url || null,
         data.onvif_url || null,
         data.username || null,
         await encryptSecret(data.password || null, secret),
-        data.main_stream || null,
+        data.main_stream || data.rtsp_url || null,
         data.sub_stream || null,
         data.enabled === false ? 0 : 1,
         data.recording_enabled === false ? 0 : 1,

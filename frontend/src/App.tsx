@@ -119,24 +119,13 @@ export default function App() {
     }
   };
 
-  const importCameras = async (endpoint: string, apiKey: string) => {
-    if (!canWrite) {
-      denyWrite();
-      throw new Error("Your role has read-only access");
-    }
-    const result = await cameraApi.importFromApi(endpoint, apiKey);
-    await refresh();
-    setNotice(`Imported ${result.imported} camera${result.imported === 1 ? "" : "s"}${result.skipped ? `; skipped ${result.skipped} already added` : ""}`);
-    return result;
-  };
-
   if (authLoading) return <div className="loading-screen">Checking secure session…</div>;
   if (showLanding || !user) return <LandingPage onAuthenticated={nextUser => { setUser(nextUser); setPage("dashboard"); setShowSplash(true); setShowLanding(false); }} />;
   if (showSplash) return <SplashScreen onComplete={() => setShowSplash(false)} />;
 
   const content = page === "dashboard" ? <Dashboard cameras={cameras} user={user} />
     : page === "live" ? <LivePage cameras={cameras} detections={detections} />
-    : page === "cameras" ? <CamerasPage cameras={cameras} canWrite={canWrite} onAdd={() => { if (!canWrite) return denyWrite(); setEditing(null); setFormOpen(true); }} onEdit={camera => { if (!canWrite) return denyWrite(); setEditing(camera); setFormOpen(true); }} onDelete={remove} onTest={test} onImport={importCameras} />
+    : page === "cameras" ? <CamerasPage cameras={cameras} canWrite={canWrite} onAdd={() => { if (!canWrite) return denyWrite(); setEditing(null); setFormOpen(true); }} onEdit={camera => { if (!canWrite) return denyWrite(); setEditing(camera); setFormOpen(true); }} onDelete={remove} onTest={test} />
     : page === "recordings" ? <RecordingsPage cameras={cameras} />
     : page === "ai" ? <AIHub cameras={cameras} canWrite={canWrite} />
     : page === "events" ? <EventsPage cameras={cameras} />
