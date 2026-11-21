@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "npm --prefix frontend run dev",
     "build": "npm --prefix frontend install && npm --prefix frontend run build",
-    "typecheck": "npm --prefix frontend run typecheck",
+    "typecheck": "npm --prefix frontend run typecheck && npm run typecheck:worker",
+    "typecheck:worker": "node frontend/node_modules/typescript/bin/tsc -p tsconfig.cloudflare.json",
+    "setup:cloudflare": "node scripts/setup-cloudflare.mjs",
     "deploy": "npm run build && npx wrangler deploy"
   }
 }

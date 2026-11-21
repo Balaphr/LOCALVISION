@@ -1,120 +1,93 @@
 # LocalVision
 
-Phase 1 foundation for a self-hosted, vendor-neutral AI CCTV platform. This directory is intentionally isolated from any existing recorder or AI service.
+LocalVision runs entirely on Cloudflare: the React frontend is served as Worker assets, the API is a Cloudflare Worker, and all data lives in a D1 database. There is no local server, no Ubuntu VM, no tunnel, no port forwarding, and no proxy to keep online.
 
-## Development
+## What works in the cloud
 
-Backend (PowerShell):
+- Sign in, sessions, password change, guest mode, users and roles
+- Cameras, zones, shares, integrations, storage server configuration
+- Events, detections, alerts, audit logs, settings and health endpoints
 
-```powershell
-cd localvision/backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-$env:SECRET_KEY = "set-a-development-secret"
-$env:ENCRYPTION_KEY = "set-a-development-encryption-secret"
-uvicorn app.main:app --reload --port 8000
-```
+Live camera video, RTSP/ONVIF probing, ffmpeg recording, local media files and AI inference need hardware on your network, so those endpoints return a clear "unavailable in the Cloudflare-only deployment" response. They cannot run on Cloudflare Workers.
 
-Frontend:
+## One-time setup
 
-```powershell
-cd localvision/frontend
-npm install
-npm run dev
-```
-
-Run backend tests with `pytest` from `localvision/backend`. SQLite is used by default for development; production PostgreSQL is configured through `DATABASE_URL`. ONVIF discovery is a safe no-op foundation in Phase 1 and does not automatically save devices.
-
-## Always-on cloud VPS + Cloudflare (recommended)
-
-Use this when the site must stay online after your PC or office machine shuts down. The full application (frontend and API) runs on a cloud VM and is published through a Cloudflare Tunnel. There is no local server, no port forwarding, no public-IP firewall rule, and no TLS certificate to manage. Cloudflare error `530` means the origin was unreachable; this setup keeps the origin online 24/7.
-
-### 1. Create the tunnel in Cloudflare
-
-1. In the Cloudflare Zero Trust dashboard, open **Networks → Tunnels → Create a tunnel** and choose **Cloudflared**.
-2. Name it `localvision` and copy the tunnel token.
-3. Add a **Public Hostname**: subdomain `localvision`, your domain, service `HTTP`, URL `127.0.0.1:8000`.
-4. Save. Use that hostname below as `LOCALVISION_APP_DOMAIN`.
-
-If an old proxied DNS record or Worker route still points at the dead local machine, remove it. Requests must reach the tunnel hostname, otherwise the `530` will remain.
-
-### 2. Prepare the VPS
-
-Use an Ubuntu 22.04/24.04 VM with at least 2 GB RAM. Push these changes to GitHub first, then on the VM:
+You need a Cloudflare account. From this folder:
 
 ```bash
-git clone https://github.com/Balaphr/LOCALVISION.git /tmp/localvision-source
-cd /tmp/localvision-source
+npx wrangler login
+npm run setup:cloudflare
 ```
 
-### 3. Deploy
+The setup script applies `cloudflare/schema.sql` to the existing D1 database, stores `ENCRYPTION_KEY`, `SECRET_KEY` and `ADMIN_PASSWORD` as Worker secrets (you will be prompted for the admin password), builds the frontend, and deploys the Worker.
+
+The D1 binding is already configured in `wrangler.toml` with the existing database id:
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "localvision"
+database_id = "edd8abfb-39b3-4ee2-8ecc-b6cb4cffa399"
+```
+
+Open the URL printed by `wrangler deploy` and sign in with username `admin` (or the `ADMIN_USERNAME` var in `wrangler.toml`) and the password you entered. Change the password later from the Account Settings page; changing the `ADMIN_PASSWORD` secret only affects a fresh database.
+
+## Connect your domain
+
+Do **not** delete the proxied `AAAA 100::` placeholder records on the apex and `www`. They keep the hostname on Cloudflare's edge and are correct for a Worker-route-only setup. The `530` is caused by having no route to the new Worker, not by those records.
+
+Add the route **after** the new code is deployed. If you add `balasoftware.in/*` before deploying, it will still point at the old proxy Worker, which fails without a live `BACKEND_ORIGIN`. The apex route is already configured in `wrangler.toml`:
+
+```toml
+[[routes]]
+pattern = "balasoftware.in/*"
+zone_name = "balasoftware.in"
+```
+
+It is applied by `npx wrangler deploy`. To serve `www` as well, add a second `[[routes]]` block with `pattern = "www.balasoftware.in/*"` and deploy again. Adding routes disables the `workers.dev` subdomain unless you also set `workers_dev = true`.
+
+Remove any old Worker route that still points at the old proxy Worker. Keep the DNS records as they are.
+
+## Manual setup
+
+If you prefer to run each step yourself, in this order:
 
 ```bash
-export LOCALVISION_APP_DOMAIN=localvision.example.com
-export TUNNEL_TOKEN="paste-the-tunnel-token-here"
-sudo --preserve-env=LOCALVISION_APP_DOMAIN,TUNNEL_TOKEN bash scripts/deploy-vps.sh
+npx wrangler d1 execute localvision --remote --file=cloudflare/schema.sql
+npx wrangler deploy
 ```
 
-The script installs Python/Node/ffmpeg, creates the `localvision` system user, writes `/opt/localvision/backend/.env` with random secrets and a random admin password (printed once), builds the frontend, applies database migrations, installs and starts the `localvision-api` and `localvision-cloudflared` systemd services, and verifies `/api/health`. Everything is enabled on boot and restarts automatically. `ADMIN_PASSWORD` is only used on the first deployment; change it later from the Users page.
+Confirm the deploy output lists a D1 binding named `DB`, then add the routes described above. Set the initial password with `npx wrangler secret put ADMIN_PASSWORD` if you have not already.
 
-Open `https://localvision.example.com` and sign in with the printed credentials. Cookies are HTTPS-only (`COOKIE_SECURE=true`) and CORS is restricted to your hostname.
-
-Useful commands:
+## Updates
 
 ```bash
-systemctl status localvision-api localvision-cloudflared
-journalctl -u localvision-api -f
+npm run deploy
 ```
 
-To update, pull the changes on the VM and rerun the same deploy command. It preserves the database, storage, and existing environment file.
+Database migrations are additive: rerun `npx wrangler d1 execute localvision --remote --file=cloudflare/schema.sql` after pulling a newer schema.
 
-Data lives in `/opt/localvision/backend/localvision.db` and `/opt/localvision/backend/storage`. Redeploying preserves the database, storage, and `.env`.
-
-### 4. If you keep the Cloudflare Worker/Pages deployment
-
-The tunnel origin can also serve only the API. Add a second public hostname such as `origin.example.com` pointing to `HTTP` / `127.0.0.1:8000`, then set the Worker variable:
+## Local development
 
 ```bash
-npx wrangler secret put BACKEND_ORIGIN
+npx wrangler d1 execute localvision --local --file=cloudflare/schema.sql
+npx wrangler dev
 ```
 
-Enter `https://origin.example.com`. Keep that hostname outside the Worker's route so requests do not loop. The Worker serves the frontend and proxies `/api` to the VPS. For Pages, set `BACKEND_ORIGIN` in the Pages project settings instead.
+For frontend-only work, run `npm run dev`; the Vite proxy still targets a local FastAPI backend on port 8000 and is only needed for the legacy Python code in `backend/`.
 
-## Ubuntu LAN deployment (legacy, depends on a local machine)
+## Configuration
 
-This deployment runs the API and built frontend together in one foreground Uvicorn process. It does not install a systemd unit, alter Nginx, stop another application, or install OS packages. All deployment state (virtual environment, Node modules/cache, database, recordings/storage, and backend `.env`) is kept under:
+| Setting | Where | Notes |
+| --- | --- | --- |
+| `ADMIN_USERNAME` | `wrangler.toml` vars | Default `admin`; used only when the users table is empty. |
+| `ADMIN_PASSWORD` | Worker secret | Initial password on a fresh database. |
+| `SESSION_HOURS` | `wrangler.toml` vars | Default `24`. |
+| `ALLOW_GUEST_MODE` | `wrangler.toml` vars | Default `false`. |
+| `ENCRYPTION_KEY`, `SECRET_KEY` | Worker secrets | Generated automatically by the setup script. |
 
-```text
-/media/manoranjitham/Admin2/LocalVision
-```
+Cookies are `HttpOnly`, `Secure` and `SameSite=Lax` on HTTPS deployments.
 
-The `Admin2` path must already be mounted. The deploy script aborts rather than creating files on the wrong filesystem. It also checks that the target port is free before starting; it will not stop an existing listener.
+## Access control
 
-### Prerequisites
-
-Install or otherwise provide these on Ubuntu before running the script; the script itself does not use `sudo` or modify system packages:
-
-- Python 3.11 or newer, with `venv` support
-- Node.js 20.19+ or 22.12+, plus npm (required by the checked-in Vite lockfile)
-- `openssl`, `tar`, `mountpoint`, and `ss`
-- `ffmpeg` for camera media/recording features
-- Network access to the configured Python and npm package registries during the first install
-
-### Deploy and start
-
-The Windows workspace provides `LocalVision-Ubuntu-Port8082.zip`, a source package with deployment scripts and this procedure but without `.env` files, databases, storage, virtual environments, Node modules, or build caches. Transfer the zip to Ubuntu using your existing local/VMware file-transfer method. Extract it directly into the target project directory, then run:
-
-```bash
-mkdir -p /media/manoranjitham/Admin2/LocalVision
-cd /media/manoranjitham/Admin2/LocalVision
-unzip -o LocalVision-Ubuntu-Port8082.zip
-bash scripts/deploy-ubuntu.sh
-bash scripts/run-ubuntu.sh
-```
-
-On the first deployment, the script creates `backend/.env` with random application secrets and a random initial admin password. It prints the admin password once to that Ubuntu terminal; save it securely. The file is created with owner-only permissions and is never copied from the source checkout. Subsequent deployments preserve the existing `.env`, database, and storage. To change deployment settings, edit only `backend/.env` inside the deployment folder.
-
-The LAN deployment uses HTTP on `192.168.1.25:8082`, leaving BalaSoftware on port 8081 untouched. `COOKIE_SECURE=false` is required for browser sign-in over HTTP. **HTTP sends passwords and session cookies without transport encryption. Use this only on a trusted private LAN; do not port-forward or expose this port to the internet.** For HTTPS through an already-configured trusted terminator, set `COOKIE_SECURE=true` in the project-local `.env`; these scripts do not configure TLS or a proxy.
-
-Open `http://192.168.1.25:8082`. The API health check is `http://192.168.1.25:8082/api/health`. Keep the terminal running; press `Ctrl+C` to stop only this LocalVision process. No firewall, service-manager, or Nginx rules are changed by these scripts.
+All `/api` routes except health, login and guest require the `localvision_session` cookie. User management requires the `admin` role. Sessions are stored in D1 with expiry enforced per request.

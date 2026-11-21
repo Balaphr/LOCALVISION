@@ -1,0 +1,27 @@
+name = "localvision"
+compatibility_date = "2026-11-19"
+main = "worker.ts"
+
+[build]
+command = "node scripts/build-if-needed.mjs"
+watch_dir = "frontend"
+
+[assets]
+directory = "./frontend/dist"
+binding = "ASSETS"
+run_worker_first = ["/api", "/api/*", "/health", "/ready"]
+not_found_handling = "single-page-application"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "localvision"
+database_id = "edd8abfb-39b3-4ee2-8ecc-b6cb4cffa399"
+
+[[routes]]
+pattern = "balasoftware.in/*"
+zone_name = "balasoftware.in"
+
+[vars]
+ADMIN_USERNAME = "admin"
+SESSION_HOURS = "24"
+ALLOW_GUEST_MODE = "false"

@@ -1,9 +1,5 @@
-import { proxyApiRequest } from "../../shared/apiProxy";
-
-interface Env {
-  BACKEND_ORIGIN?: string;
-}
+import { handleApi, type Env } from "../../cloudflare/api";
 
 export async function onRequest({ request, env }: { request: Request; env: Env }) {
-  return proxyApiRequest(request, env);
+  return handleApi(request, env);
 }
