@@ -26,7 +26,62 @@ npm run dev
 
 Run backend tests with `pytest` from `localvision/backend`. SQLite is used by default for development; production PostgreSQL is configured through `DATABASE_URL`. ONVIF discovery is a safe no-op foundation in Phase 1 and does not automatically save devices.
 
-## Ubuntu LAN deployment (no system-service or Nginx changes)
+## Always-on cloud VPS + Cloudflare (recommended)
+
+Use this when the site must stay online after your PC or office machine shuts down. The full application (frontend and API) runs on a cloud VM and is published through a Cloudflare Tunnel. There is no local server, no port forwarding, no public-IP firewall rule, and no TLS certificate to manage. Cloudflare error `530` means the origin was unreachable; this setup keeps the origin online 24/7.
+
+### 1. Create the tunnel in Cloudflare
+
+1. In the Cloudflare Zero Trust dashboard, open **Networks → Tunnels → Create a tunnel** and choose **Cloudflared**.
+2. Name it `localvision` and copy the tunnel token.
+3. Add a **Public Hostname**: subdomain `localvision`, your domain, service `HTTP`, URL `127.0.0.1:8000`.
+4. Save. Use that hostname below as `LOCALVISION_APP_DOMAIN`.
+
+If an old proxied DNS record or Worker route still points at the dead local machine, remove it. Requests must reach the tunnel hostname, otherwise the `530` will remain.
+
+### 2. Prepare the VPS
+
+Use an Ubuntu 22.04/24.04 VM with at least 2 GB RAM. Push these changes to GitHub first, then on the VM:
+
+```bash
+git clone https://github.com/Balaphr/LOCALVISION.git /tmp/localvision-source
+cd /tmp/localvision-source
+```
+
+### 3. Deploy
+
+```bash
+export LOCALVISION_APP_DOMAIN=localvision.example.com
+export TUNNEL_TOKEN="paste-the-tunnel-token-here"
+sudo --preserve-env=LOCALVISION_APP_DOMAIN,TUNNEL_TOKEN bash scripts/deploy-vps.sh
+```
+
+The script installs Python/Node/ffmpeg, creates the `localvision` system user, writes `/opt/localvision/backend/.env` with random secrets and a random admin password (printed once), builds the frontend, applies database migrations, installs and starts the `localvision-api` and `localvision-cloudflared` systemd services, and verifies `/api/health`. Everything is enabled on boot and restarts automatically. `ADMIN_PASSWORD` is only used on the first deployment; change it later from the Users page.
+
+Open `https://localvision.example.com` and sign in with the printed credentials. Cookies are HTTPS-only (`COOKIE_SECURE=true`) and CORS is restricted to your hostname.
+
+Useful commands:
+
+```bash
+systemctl status localvision-api localvision-cloudflared
+journalctl -u localvision-api -f
+```
+
+To update, pull the changes on the VM and rerun the same deploy command. It preserves the database, storage, and existing environment file.
+
+Data lives in `/opt/localvision/backend/localvision.db` and `/opt/localvision/backend/storage`. Redeploying preserves the database, storage, and `.env`.
+
+### 4. If you keep the Cloudflare Worker/Pages deployment
+
+The tunnel origin can also serve only the API. Add a second public hostname such as `origin.example.com` pointing to `HTTP` / `127.0.0.1:8000`, then set the Worker variable:
+
+```bash
+npx wrangler secret put BACKEND_ORIGIN
+```
+
+Enter `https://origin.example.com`. Keep that hostname outside the Worker's route so requests do not loop. The Worker serves the frontend and proxies `/api` to the VPS. For Pages, set `BACKEND_ORIGIN` in the Pages project settings instead.
+
+## Ubuntu LAN deployment (legacy, depends on a local machine)
 
 This deployment runs the API and built frontend together in one foreground Uvicorn process. It does not install a systemd unit, alter Nginx, stop another application, or install OS packages. All deployment state (virtual environment, Node modules/cache, database, recordings/storage, and backend `.env`) is kept under:
 
