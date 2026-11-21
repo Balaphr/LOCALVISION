@@ -287,7 +287,149 @@ const guestLogin = async (request: Request, env: Env): Promise<Response> => {
   });
 };
 
-const camerasRoute = async (request: Request, env: Env, parts: string[], method: string): Promise<Response> => {
+const cameraProtocols = ["RTSP", "ONVIF", "HTTP", "MJPEG", "Other"];
+
+const importCamerasFromApi = async (request: Request, env: Env, user: any): Promise<Response> => {
+  const data = await bodyOf(request);
+  const endpointRaw = String(data.endpoint ?? "").trim();
+  const apiKey = String(data.api_key ?? "");
+
+  if (!endpointRaw) return fail("Camera API endpoint is required", 422);
+  let endpoint: URL;
+  try {
+    endpoint = new URL(endpointRaw);
+  } catch {
+    return fail(`Invalid camera API URL: ${endpointRaw}`, 422);
+  }
+  if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") {
+    return fail(`Camera API URL must use http or https: ${endpointRaw}`, 422);
+  }
+  if (!endpoint.hostname) return fail(`Invalid camera API URL: ${endpointRaw}`, 422);
+  if (!apiKey) return fail("API key is required", 422);
+  if (apiKey.length > 500) return fail("API key is too long", 422);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  let upstream: Response;
+  try {
+    upstream = await fetch(endpoint.toString(), {
+      method: "GET",
+      headers: { "X-API-Key": apiKey, Accept: "application/json" },
+      signal: controller.signal,
+      redirect: "follow"
+    });
+  } catch (error: any) {
+    return fail(`Could not reach camera API: ${error?.message || "unknown error"}`, 502);
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const rawText = await upstream.text();
+  const snippet = (value: string) => (value.length > 500 ? `${value.slice(0, 500)}…` : value);
+  if (!upstream.ok) {
+    return fail(`Camera API returned HTTP ${upstream.status}: ${snippet(rawText)}`, 502);
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(rawText);
+  } catch {
+    return fail(`Camera API did not return valid JSON: ${snippet(rawText)}`, 502);
+  }
+  if (!Array.isArray(payload)) return fail("Camera API must return a JSON array", 422);
+  if (payload.length > 100) return fail(`Camera API returned ${payload.length} cameras; maximum is 100`, 422);
+
+  const candidates: any[] = [];
+  for (let index = 0; index < payload.length; index += 1) {
+    const item = payload[index];
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return fail(`Camera at index ${index} is invalid: expected an object`, 422);
+    }
+    const name = String(item.name ?? "").trim();
+    const host = String(item.host ?? "").trim();
+    if (!name) return fail(`Camera at index ${index} is invalid: name is required`, 422);
+    if (!host) return fail(`Camera at index ${index} is invalid: host is required`, 422);
+    const port = item.port === undefined || item.port === null || item.port === "" ? 554 : Number(item.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return fail(`Camera at index ${index} has an invalid port: ${String(item.port)}`, 422);
+    }
+    const protocol = String(item.protocol ?? "RTSP");
+    if (!cameraProtocols.includes(protocol)) {
+      return fail(`Camera at index ${index} has an invalid protocol: ${protocol}`, 422);
+    }
+    const externalValue = item.id === undefined || item.id === null ? "" : String(item.id).trim();
+    const identity = `${host.toLowerCase()}:${port}:${protocol}`;
+    candidates.push({
+      item,
+      name,
+      host,
+      port,
+      protocol,
+      identity,
+      externalId: externalValue ? `id:${externalValue}` : `route:${identity}`
+    });
+  }
+
+  const normalizedEndpoint = endpoint.toString();
+  const importedRows = await all(env.DB, "SELECT external_id, host, port, protocol FROM cameras WHERE import_endpoint=?", normalizedEndpoint);
+  const existingExternal = new Set(importedRows.map((row) => String(row.external_id)));
+  const allCameras = await all(env.DB, "SELECT host, port, protocol FROM cameras");
+  const existingIdentity = new Set(allCameras.map((row) => `${String(row.host).toLowerCase()}:${row.port}:${row.protocol}`));
+
+  const statements: any[] = [];
+  let imported = 0;
+  let skipped = 0;
+  for (const candidate of candidates) {
+    if (existingExternal.has(candidate.externalId) || existingIdentity.has(candidate.identity)) {
+      skipped += 1;
+      continue;
+    }
+    const item = candidate.item;
+    const password = item.password ? String(item.password) : null;
+    const createdAt = stamp();
+    statements.push(
+      env.DB.prepare(
+        "INSERT INTO cameras (name,location,manufacturer,model,host,port,protocol,rtsp_url,onvif_url,username,password_enc,main_stream,sub_stream,enabled,recording_enabled,ai_enabled,import_endpoint,external_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+      ).bind(
+        candidate.name,
+        String(item.location ?? "").slice(0, 200),
+        String(item.manufacturer ?? "Generic").slice(0, 80),
+        String(item.model ?? "").slice(0, 120),
+        candidate.host,
+        candidate.port,
+        candidate.protocol,
+        item.rtsp_url ? String(item.rtsp_url) : null,
+        item.onvif_url ? String(item.onvif_url) : null,
+        item.username ? String(item.username) : null,
+        await encryptSecret(password, env.ENCRYPTION_KEY || env.SECRET_KEY),
+        item.main_stream ? String(item.main_stream) : null,
+        item.sub_stream ? String(item.sub_stream) : null,
+        item.enabled === false ? 0 : 1,
+        item.recording_enabled === false ? 0 : 1,
+        item.ai_enabled === false ? 0 : 1,
+        normalizedEndpoint,
+        candidate.externalId,
+        createdAt,
+        createdAt
+      )
+    );
+    existingExternal.add(candidate.externalId);
+    existingIdentity.add(candidate.identity);
+    imported += 1;
+  }
+
+  if (statements.length) {
+    try {
+      await env.DB.batch(statements);
+    } catch (error: any) {
+      return fail(`Database save failed: ${error?.message || "unknown error"}`, 500);
+    }
+    await audit(request, env, user, "camera.api_imported", String(imported));
+  }
+  return json({ imported, skipped });
+};
+
+const camerasRoute = async (request: Request, env: Env, parts: string[], method: string, user: any): Promise<Response> => {
   const db = env.DB;
   const id = parts[2] ? Number(parts[2]) : NaN;
   const sub = parts[3];
@@ -326,7 +468,7 @@ const camerasRoute = async (request: Request, env: Env, parts: string[], method:
   }
 
   if (parts[2] === "discover" && method === "POST") return json([]);
-  if (parts[2] === "import" && method === "POST") return json({ imported: 0, skipped: 0 });
+  if (parts[2] === "import" && method === "POST") return importCamerasFromApi(request, env, user);
   if (parts[2] === "test" && method === "POST") {
     return json({ status: "unreachable", message: "Live camera probing is not available in the Cloudflare-only deployment." });
   }
@@ -634,7 +776,7 @@ const route = async (request: Request, env: Env): Promise<Response> => {
     return empty();
   }
 
-  if (parts[1] === "cameras") return camerasRoute(request, env, parts, method);
+  if (parts[1] === "cameras") return camerasRoute(request, env, parts, method, user);
   if (parts[1] === "users") return usersRoute(request, env, parts, method, user);
   if (parts[1] === "storage" && parts[2] === "servers") return storageServersRoute(request, env, parts, method);
   if (path === "/api/storage/overview" && method === "GET") return storageOverview(env);

@@ -39,9 +39,13 @@ CREATE TABLE IF NOT EXISTS cameras (
   enabled INTEGER NOT NULL DEFAULT 1,
   recording_enabled INTEGER NOT NULL DEFAULT 1,
   ai_enabled INTEGER NOT NULL DEFAULT 1,
+  import_endpoint TEXT,
+  external_id TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cameras_import_route ON cameras(import_endpoint, external_id);
 
 CREATE TABLE IF NOT EXISTS zones (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

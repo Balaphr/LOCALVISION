@@ -35,6 +35,13 @@ if (whoami.status !== 0) {
 console.log("Applying database schema...");
 run("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--file=cloudflare/schema.sql"]);
 
+const columns = capture("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--command", "PRAGMA table_info(cameras);"]);
+const columnText = `${columns.stdout || ""}${columns.stderr || ""}`;
+if (!columnText.includes("import_endpoint")) {
+  console.log("Applying camera import migration...");
+  run("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--file=cloudflare/migrations/0001_camera_import.sql"]);
+}
+
 const secrets = capture("npx", ["wrangler", "secret", "list", "--json"]);
 const secretText = `${secrets.stdout || ""}${secrets.stderr || ""}`;
 
