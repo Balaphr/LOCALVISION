@@ -12,6 +12,8 @@ export interface Env {
   ALLOW_GUEST_MODE?: string;
   ENCRYPTION_KEY?: string;
   SECRET_KEY?: string;
+  MEDIA_BRIDGE_URL?: string;
+  MEDIA_BRIDGE_TOKEN?: string;
 }
 
 const json = (data: any, status = 200, headers: Record<string, string> = {}) =>
@@ -432,6 +434,34 @@ const importCamerasFromApi = async (request: Request, env: Env, user: any): Prom
   return json({ imported, skipped });
 };
 
+const proxyMedia = async (request: Request, env: Env, camera: any, snapshotOnly: boolean): Promise<Response> => {
+  if (!env.MEDIA_BRIDGE_URL || !env.MEDIA_BRIDGE_TOKEN) return fail("Media bridge is not configured.", 503);
+  const source = camera.rtsp_url || camera.main_stream;
+  if (!source) return fail("No RTSP stream URL is configured for this camera.", 422);
+  const target = new URL(snapshotOnly ? "/snapshot" : "/stream", env.MEDIA_BRIDGE_URL);
+  let upstream: Response;
+  try {
+    upstream = await fetch(target.toString(), {
+      method: "GET",
+      headers: { "X-Bridge-Token": env.MEDIA_BRIDGE_TOKEN, "X-RTSP-URL": String(source), Accept: snapshotOnly ? "image/jpeg" : "multipart/x-mixed-replace" },
+      signal: request.signal
+    });
+  } catch (error: any) {
+    return fail(`Media bridge is unreachable: ${error?.message || "unknown error"}`, 502);
+  }
+  if (!upstream.ok) {
+    const detail = await upstream.text().catch(() => "");
+    return fail(`Media bridge error: ${detail.slice(0, 500)}`, 502);
+  }
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: {
+      "content-type": upstream.headers.get("content-type") || (snapshotOnly ? "image/jpeg" : "multipart/x-mixed-replace; boundary=frame"),
+      "cache-control": "no-store"
+    }
+  });
+};
+
 const camerasRoute = async (request: Request, env: Env, parts: string[], method: string, user: any): Promise<Response> => {
   const db = env.DB;
   const id = parts[2] ? Number(parts[2]) : NaN;
@@ -520,12 +550,8 @@ const camerasRoute = async (request: Request, env: Env, parts: string[], method:
   if (sub === "status") {
     return json({ camera_id: id, status: "unknown", protocol: camera.protocol, resolution: null, fps: null, message: "Live camera status requires a local media service." });
   }
-  if (sub === "snapshot") {
-    return json({ camera_id: id, status: "unavailable", message: "Snapshots require a local media service." });
-  }
-  if (sub === "preview.jpg" || sub === "stream.mjpeg" || sub === "live") {
-    return fail("Live media is unavailable in the Cloudflare-only deployment.", 501);
-  }
+  if (sub === "snapshot" || sub === "preview.jpg") return proxyMedia(request, env, camera, true);
+  if (sub === "stream.mjpeg" || sub === "live") return proxyMedia(request, env, camera, false);
 
   if (sub === "zones") {
     if (method === "GET") {

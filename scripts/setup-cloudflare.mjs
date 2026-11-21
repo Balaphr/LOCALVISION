@@ -56,6 +56,10 @@ if (!secretText.includes("ADMIN_PASSWORD")) {
   console.log("Set the initial admin password when prompted.");
   run("npx", ["wrangler", "secret", "put", "ADMIN_PASSWORD"]);
 }
+if (!secretText.includes("MEDIA_BRIDGE_TOKEN")) {
+  console.log("Set the media bridge token when prompted (use the same value as bridge/.env).");
+  run("npx", ["wrangler", "secret", "put", "MEDIA_BRIDGE_TOKEN"]);
+}
 
 console.log("Building frontend...");
 run(npm, ["run", "build"]);
