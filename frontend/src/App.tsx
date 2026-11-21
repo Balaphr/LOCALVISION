@@ -109,23 +109,13 @@ export default function App() {
     }
   };
 
-  const test = async (camera: Camera) => {
-    if (!canWrite) return denyWrite();
-    try {
-      const result = await cameraApi.test(camera.id);
-      setNotice(`${camera.name}: ${result.status === "reachable" ? result.message : result.hints ?? result.message}`);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Connection test failed");
-    }
-  };
-
   if (authLoading) return <div className="loading-screen">Checking secure session…</div>;
   if (showLanding || !user) return <LandingPage onAuthenticated={nextUser => { setUser(nextUser); setPage("dashboard"); setShowSplash(true); setShowLanding(false); }} />;
   if (showSplash) return <SplashScreen onComplete={() => setShowSplash(false)} />;
 
   const content = page === "dashboard" ? <Dashboard cameras={cameras} user={user} />
     : page === "live" ? <LivePage cameras={cameras} detections={detections} />
-    : page === "cameras" ? <CamerasPage cameras={cameras} canWrite={canWrite} onAdd={() => { if (!canWrite) return denyWrite(); setEditing(null); setFormOpen(true); }} onEdit={camera => { if (!canWrite) return denyWrite(); setEditing(camera); setFormOpen(true); }} onDelete={remove} onTest={test} />
+    : page === "cameras" ? <CamerasPage cameras={cameras} canWrite={canWrite} onAdd={() => { if (!canWrite) return denyWrite(); setEditing(null); setFormOpen(true); }} onEdit={camera => { if (!canWrite) return denyWrite(); setEditing(camera); setFormOpen(true); }} onDelete={remove} />
     : page === "recordings" ? <RecordingsPage cameras={cameras} />
     : page === "ai" ? <AIHub cameras={cameras} canWrite={canWrite} />
     : page === "events" ? <EventsPage cameras={cameras} />

@@ -1,6 +1,6 @@
 import type { Camera, CameraInput } from "../types/camera";
 import type { RecordingPage, Zone, ZoneInput } from "../types/recording";
-import type { AiStatus, AlertItem, CameraTestResult, DiscoveryResult, EventItem, Integration, IntegrationInput, Metrics } from "../types/operations";
+import type { AiStatus, AlertItem, DiscoveryResult, EventItem, Integration, IntegrationInput, Metrics } from "../types/operations";
 import type { LoginResponse, Role, Share, User, UserRecord } from "../types/auth";
 import type { StorageIntegration, StorageIntegrationInput, StorageOverview, StorageProbe } from "../types/storage";
 
@@ -26,8 +26,6 @@ export const cameraApi = {
   inspectOnvif: (endpoint: string, username?: string, password?: string) => request<DiscoveryResult>("/api/cameras/onvif/inspect", { method: "POST", body: JSON.stringify({ endpoint, username: username || null, password: password || null }) }),
   update: (id: number, input: Partial<CameraInput>) => request<Camera>(`/api/cameras/${id}`, { method: "PUT", body: JSON.stringify(input) }),
   remove: (id: number) => request<void>(`/api/cameras/${id}`, { method: "DELETE" }),
-  test: (id: number) => request<CameraTestResult>(`/api/cameras/${id}/test`, { method: "POST" }),
-  testDraft: (input: CameraInput, cameraId?: number) => request<CameraTestResult>(cameraId ? `/api/cameras/${cameraId}/test-draft` : "/api/cameras/test", { method: "POST", body: JSON.stringify(input) }),
   status: (id: number) => request<{ camera_id: number; status: string; protocol: string; resolution?: string | null; fps?: number | null; message?: string | null }>(`/api/cameras/${id}/status`),
   snapshot: (id: number) => request<{ camera_id: number; status: string; path?: string; url?: string; message?: string }>(`/api/cameras/${id}/snapshot`),
   previewUrl: (id: number) => `/api/cameras/${id}/preview.jpg?t=${Date.now()}`,
