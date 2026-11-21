@@ -42,6 +42,13 @@ if (!columnText.includes("import_endpoint")) {
   run("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--file=cloudflare/migrations/0001_camera_import.sql"]);
 }
 
+const tables = capture("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--command", "SELECT name FROM sqlite_master WHERE type='table' AND name='camera_recordings';"]);
+const tableText = `${tables.stdout || ""}${tables.stderr || ""}`;
+if (!tableText.includes("camera_recordings")) {
+  console.log("Applying camera recordings migration...");
+  run("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--file=cloudflare/migrations/0002_camera_recordings.sql"]);
+}
+
 const secrets = capture("npx", ["wrangler", "secret", "list", "--json"]);
 const secretText = `${secrets.stdout || ""}${secrets.stderr || ""}`;
 

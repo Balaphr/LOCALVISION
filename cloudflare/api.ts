@@ -64,6 +64,91 @@ const userView = (user: any) => ({
   created_at: user.created_at
 });
 
+const redactStreamUrl = (value: any): string | null => {
+  if (!value) return null;
+  try {
+    const url = new URL(String(value));
+    if (url.username || url.password) {
+      url.username = "";
+      url.password = "";
+      return url.toString();
+    }
+  } catch {}
+  return String(value);
+};
+
+const splitCredentials = (value: any) => {
+  const raw = String(value ?? "").trim();
+  if (!/^rtsps?:\/\//i.test(raw)) return { url: raw, username: "", password: "" };
+  try {
+    const url = new URL(raw);
+    const username = decodeURIComponent(url.username);
+    const password = decodeURIComponent(url.password);
+    if (!username && !password) return { url: raw, username: "", password: "" };
+    url.username = "";
+    url.password = "";
+    return { url: url.toString(), username, password };
+  } catch {
+    return { url: raw, username: "", password: "" };
+  }
+};
+
+const normalizeCameraInput = async (env: Env, data: any) => {
+  const result = { ...data };
+  for (const key of ["rtsp_url", "main_stream", "sub_stream"]) {
+    if (!result[key]) continue;
+    const parsed = splitCredentials(result[key]);
+    result[key] = parsed.url;
+    if (parsed.username && !result.username) result.username = parsed.username;
+    if (parsed.password && !result.password) result.password = parsed.password;
+  }
+  return result;
+};
+
+const migrateCameraCredentials = (env: Env) => {
+  if (!credentialMigrationPromise) {
+    credentialMigrationPromise = (async () => {
+      const cameras = await all(env.DB, "SELECT * FROM cameras");
+      for (const camera of cameras) {
+        const fields: Record<string, any> = {};
+        let username = camera.username;
+        let password = "";
+        for (const key of ["rtsp_url", "main_stream", "sub_stream"]) {
+          if (!camera[key]) continue;
+          const parsed = splitCredentials(camera[key]);
+          if (parsed.url === String(camera[key])) continue;
+          fields[key] = parsed.url;
+          if (parsed.username && !username) username = parsed.username;
+          if (parsed.password && !password) password = parsed.password;
+        }
+        if (!Object.keys(fields).length) continue;
+        if (username) fields.username = username;
+        if (password) fields.password_enc = await encryptSecret(password, env.ENCRYPTION_KEY || env.SECRET_KEY);
+        fields.updated_at = stamp();
+        await run(env.DB, `UPDATE cameras SET ${Object.keys(fields).map((key) => `${key}=?`).join(",")} WHERE id=?`, ...Object.values(fields), camera.id);
+      }
+    })().catch((error) => {
+      credentialMigrationPromise = undefined;
+      throw error;
+    });
+  }
+  return credentialMigrationPromise;
+};
+
+let credentialMigrationPromise: Promise<void> | undefined;
+
+const cameraSource = async (env: Env, camera: any): Promise<string> => {
+  const value = String(camera.rtsp_url || camera.main_stream || "");
+  if (!/^rtsps?:\/\//i.test(value)) return value;
+  const url = new URL(value);
+  if (camera.username) {
+    const secret = await decryptSecret(camera.password_enc, env.ENCRYPTION_KEY || env.SECRET_KEY);
+    if (!url.username) url.username = String(camera.username);
+    if (!url.password) url.password = secret || "";
+  }
+  return url.toString();
+};
+
 const cameraView = (camera: any) => ({
   id: camera.id,
   name: camera.name,
@@ -73,11 +158,11 @@ const cameraView = (camera: any) => ({
   host: camera.host,
   port: camera.port,
   protocol: camera.protocol,
-  rtsp_url: camera.rtsp_url ?? null,
-  onvif_url: camera.onvif_url ?? null,
+  rtsp_url: redactStreamUrl(camera.rtsp_url),
+  onvif_url: redactStreamUrl(camera.onvif_url),
   username: camera.username ?? null,
-  main_stream: camera.main_stream ?? null,
-  sub_stream: camera.sub_stream ?? null,
+  main_stream: redactStreamUrl(camera.main_stream),
+  sub_stream: redactStreamUrl(camera.sub_stream),
   enabled: !!camera.enabled,
   recording_enabled: !!camera.recording_enabled,
   ai_enabled: !!camera.ai_enabled,
@@ -176,20 +261,23 @@ const ensureSeeded = (env: Env) => {
   if (!seedPromise) {
     seedPromise = (async () => {
       const existing = await first(env.DB, "SELECT id FROM users LIMIT 1");
-      if (existing) return;
-      const username = (env.ADMIN_USERNAME || "admin").trim();
-      const password = env.ADMIN_PASSWORD;
-      if (!password) return;
-      await run(
-        env.DB,
-        "INSERT INTO users (username,password_hash,role,permissions,is_active,created_at) VALUES (?,?,?,?,?,?)",
-        username,
-        await hashPassword(password),
-        "admin",
-        "{}",
-        1,
-        stamp()
-      );
+      if (!existing) {
+        const username = (env.ADMIN_USERNAME || "admin").trim();
+        const password = env.ADMIN_PASSWORD;
+        if (password) {
+          await run(
+            env.DB,
+            "INSERT INTO users (username,password_hash,role,permissions,is_active,created_at) VALUES (?,?,?,?,?,?)",
+            username,
+            await hashPassword(password),
+            "admin",
+            "{}",
+            1,
+            stamp()
+          );
+        }
+      }
+      await migrateCameraCredentials(env);
     })().catch((error) => {
       seedPromise = undefined;
       throw error;
@@ -434,32 +522,205 @@ const importCamerasFromApi = async (request: Request, env: Env, user: any): Prom
   return json({ imported, skipped });
 };
 
-const proxyMedia = async (request: Request, env: Env, camera: any, snapshotOnly: boolean): Promise<Response> => {
-  if (!env.MEDIA_BRIDGE_URL || !env.MEDIA_BRIDGE_TOKEN) return fail("Media bridge is not configured.", 503);
-  const source = camera.rtsp_url || camera.main_stream;
-  if (!source) return fail("No RTSP stream URL is configured for this camera.", 422);
-  const target = new URL(snapshotOnly ? "/snapshot" : "/stream", env.MEDIA_BRIDGE_URL);
-  let upstream: Response;
+const bridgeFetch = async (env: Env, path: string, init: RequestInit = {}): Promise<Response> => {
+  if (!env.MEDIA_BRIDGE_URL || !env.MEDIA_BRIDGE_TOKEN) throw new Error("Media bridge is not configured.");
+  const target = new URL(path, env.MEDIA_BRIDGE_URL);
+  const headers = new Headers(init.headers);
+  headers.set("X-Bridge-Token", env.MEDIA_BRIDGE_TOKEN);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
   try {
-    upstream = await fetch(target.toString(), {
-      method: "GET",
-      headers: { "X-Bridge-Token": env.MEDIA_BRIDGE_TOKEN, "X-RTSP-URL": String(source), Accept: snapshotOnly ? "image/jpeg" : "multipart/x-mixed-replace" },
+    return await fetch(target.toString(), { ...init, headers, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const proxyMedia = async (request: Request, env: Env, camera: any, snapshotOnly: boolean): Promise<Response> => {
+  try {
+    const source = await cameraSource(env, camera);
+    if (!source) return fail("No RTSP stream URL is configured for this camera.", 422);
+    const upstream = await bridgeFetch(env, snapshotOnly ? "/snapshot" : "/stream", {
+      headers: { "X-RTSP-URL": source, Accept: snapshotOnly ? "image/jpeg" : "multipart/x-mixed-replace" },
       signal: request.signal
+    });
+    if (!upstream.ok) {
+      const detail = await upstream.text().catch(() => "");
+      return fail(`Media bridge error: ${detail.slice(0, 500)}`, 502);
+    }
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: {
+        "content-type": upstream.headers.get("content-type") || (snapshotOnly ? "image/jpeg" : "multipart/x-mixed-replace; boundary=frame"),
+        "cache-control": "no-store",
+        "x-accel-buffering": "no"
+      }
     });
   } catch (error: any) {
     return fail(`Media bridge is unreachable: ${error?.message || "unknown error"}`, 502);
   }
-  if (!upstream.ok) {
-    const detail = await upstream.text().catch(() => "");
-    return fail(`Media bridge error: ${detail.slice(0, 500)}`, 502);
-  }
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: {
-      "content-type": upstream.headers.get("content-type") || (snapshotOnly ? "image/jpeg" : "multipart/x-mixed-replace; boundary=frame"),
-      "cache-control": "no-store"
+};
+
+const proxyHls = async (env: Env, camera: any, segment?: string): Promise<Response> => {
+  try {
+    const path = segment
+      ? `/hls/${Number(camera.id)}/${encodeURIComponent(segment)}`
+      : `/hls/${Number(camera.id)}/index.m3u8`;
+    const upstream = await bridgeFetch(env, path, { headers: { Accept: segment ? "video/mp2t" : "application/vnd.apple.mpegurl" } });
+    if (!upstream.ok) {
+      const detail = await upstream.text().catch(() => "");
+      return fail(`Media bridge error: ${detail.slice(0, 500)}`, 502);
     }
+    if (segment) {
+      return new Response(upstream.body, { status: upstream.status, headers: { "content-type": "video/mp2t", "cache-control": "no-store" } });
+    }
+    const base = `/api/cameras/${Number(camera.id)}/hls/`;
+    const playlist = (await upstream.text()).split(/\r?\n/).map((line) => {
+      const value = line.trim();
+      if (!value || value.startsWith("#") || /^[a-z]+:\/\//i.test(value)) return line;
+      return `${base}${encodeURIComponent(value.replace(/^\/+/, ""))}`;
+    }).join("\n");
+    return new Response(playlist, { status: upstream.status, headers: { "content-type": "application/vnd.apple.mpegurl", "cache-control": "no-store" } });
+  } catch (error: any) {
+    return fail(`Media bridge is unreachable: ${error?.message || "unknown error"}`, 502);
+  }
+};
+
+const cameraBridgeAction = async (env: Env, camera: any, path: string, method = "GET", payload?: any): Promise<Response> => {
+  try {
+    const source = await cameraSource(env, camera);
+    const headers: Record<string, string> = { "X-RTSP-URL": source };
+    const upstream = await bridgeFetch(env, `/camera/${Number(camera.id)}${path}`, {
+      method,
+      headers: payload ? { ...headers, "Content-Type": "application/json" } : headers,
+      body: payload ? JSON.stringify(payload) : undefined
+    });
+    const text = await upstream.text();
+    let data: any;
+    try { data = text ? JSON.parse(text) : {}; } catch { data = { detail: text.slice(0, 500) }; }
+    return json(data, upstream.status);
+  } catch (error: any) {
+    return fail(`Media bridge is unreachable: ${error?.message || "unknown error"}`, 502);
+  }
+};
+
+const bridgeConfig = async (env: Env): Promise<Response> => {
+  const cameras = await all(env.DB, "SELECT * FROM cameras WHERE enabled=1 ORDER BY id");
+  const storageRows = await all(env.DB, "SELECT * FROM storage_servers WHERE enabled=1 AND endpoint<>'' ORDER BY id");
+  const storage = storageRows.find((row: any) => row.secret_enc) ?? storageRows[0] ?? null;
+  return json({
+    cameras: await Promise.all(cameras.map(async (camera: any) => ({
+      id: Number(camera.id),
+      name: camera.name,
+      source: await cameraSource(env, camera),
+      enabled: !!camera.enabled,
+      recording_enabled: !!camera.recording_enabled
+    }))),
+    storage: storage ? {
+      id: Number(storage.id),
+      endpoint: storageBaseUrl(storage.endpoint),
+      auth_method: storage.auth_method || "none",
+      secret: await decryptSecret(storage.secret_enc, env.ENCRYPTION_KEY || env.SECRET_KEY)
+    } : null,
+    generated_at: stamp()
   });
+};
+
+const bridgeRecordingUpsert = async (request: Request, env: Env): Promise<Response> => {
+  const data = await bodyOf(request);
+  const cameraId = Number(data.camera_id);
+  if (!Number.isFinite(cameraId)) return fail("camera_id is required", 422);
+  const camera = await first(env.DB, "SELECT id,name FROM cameras WHERE id=?", cameraId);
+  if (!camera) return fail("Camera not found", 404);
+  const storageId = data.storage_server_id ? Number(data.storage_server_id) : null;
+  const storageIdValue = Number.isFinite(storageId) ? storageId : null;
+  const recordingId = String(data.storage_recording_id ?? "").trim() || null;
+  const startedAt = String(data.started_at ?? stamp());
+  const endedAt = data.ended_at ? String(data.ended_at) : null;
+  const values = [
+    cameraId,
+    storageIdValue,
+    recordingId,
+    String(data.name ?? camera.name),
+    String(data.camera ?? camera.name),
+    String(data.date ?? startedAt.slice(0, 10)),
+    String(data.time ?? (startedAt.slice(11, 19) || "00:00:00")),
+    String(data.filename ?? "recording.mp4"),
+    data.duration_seconds === null || data.duration_seconds === undefined ? null : Number(data.duration_seconds),
+    Number(data.size_bytes ?? 0) || 0,
+    String(data.status ?? "ready"),
+    startedAt,
+    endedAt
+  ];
+  await run(
+    env.DB,
+    `INSERT INTO camera_recordings (camera_id,storage_server_id,storage_recording_id,name,camera,date,time,filename,duration_seconds,size_bytes,status,started_at,ended_at,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(storage_recording_id) DO UPDATE SET
+       storage_server_id=excluded.storage_server_id,name=excluded.name,camera=excluded.camera,date=excluded.date,time=excluded.time,
+       filename=excluded.filename,duration_seconds=excluded.duration_seconds,size_bytes=excluded.size_bytes,status=excluded.status,
+       started_at=excluded.started_at,ended_at=excluded.ended_at,updated_at=excluded.updated_at`,
+    ...values,
+    stamp(),
+    stamp()
+  );
+  const saved = recordingId ? await first(env.DB, "SELECT * FROM camera_recordings WHERE storage_recording_id=?", recordingId) : await first(env.DB, "SELECT * FROM camera_recordings ORDER BY id DESC LIMIT 1");
+  return json({ id: Number(saved?.id ?? 0) }, 201);
+};
+
+const recordingView = (row: any) => ({
+  id: Number(row.id),
+  camera_id: Number(row.camera_id),
+  camera: row.camera ?? row.name ?? `Camera ${row.camera_id}`,
+  name: row.name ?? row.filename,
+  date: row.date ?? null,
+  time: row.time ?? null,
+  path: row.filename ?? "",
+  filename: row.filename ?? "recording.mp4",
+  started_at: row.started_at,
+  ended_at: row.ended_at ?? null,
+  duration_seconds: row.duration_seconds ?? null,
+  size_bytes: Number(row.size_bytes ?? 0) || 0,
+  kind: "continuous",
+  status: row.status ?? "ready",
+  storage_server_id: row.storage_server_id ?? null,
+  storage_recording_id: row.storage_recording_id ?? null,
+  fileUrl: row.storage_server_id && row.storage_recording_id ? `/api/recordings/${row.id}/file` : null,
+  downloadUrl: row.storage_server_id && row.storage_recording_id ? `/api/recordings/${row.id}/download` : null
+});
+
+const recordingsRoute = async (request: Request, env: Env, parts: string[], method: string, url: URL, user: any): Promise<Response> => {
+  const db = env.DB;
+  if (parts.length === 2 && method === "GET") {
+    const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));
+    const pageSize = Math.max(1, Number(url.searchParams.get("page_size") ?? 50));
+    const params: any[] = [];
+    let sql = "SELECT * FROM camera_recordings WHERE 1=1";
+    const cameraId = Number(url.searchParams.get("camera_id"));
+    if (Number.isFinite(cameraId) && cameraId > 0) { sql += " AND camera_id=?"; params.push(cameraId); }
+    const date = String(url.searchParams.get("date") ?? "").trim();
+    if (date) { sql += " AND date=?"; params.push(date); }
+    sql += " ORDER BY started_at DESC LIMIT ? OFFSET ?";
+    params.push(pageSize, (page - 1) * pageSize);
+    return json({ items: (await all(db, sql, ...params)).map(recordingView), page, page_size: pageSize });
+  }
+  const id = Number(parts[2]);
+  if (!Number.isFinite(id)) return fail("Recording not found", 404);
+  const row = await first(db, "SELECT * FROM camera_recordings WHERE id=?", id);
+  if (!row) return fail("Recording not found", 404);
+  if (parts.length === 3 && method === "DELETE") {
+    await run(db, "DELETE FROM camera_recordings WHERE id=?", id);
+    await audit(request, env, user, "recording.deleted", String(id));
+    return empty();
+  }
+  if (["file", "download"].includes(parts[3]) && method === "GET") {
+    if (!row.storage_server_id || !row.storage_recording_id) return fail("Recording file is not available on configured storage", 404);
+    const server = await first(db, "SELECT * FROM storage_servers WHERE id=?", row.storage_server_id);
+    if (!server) return fail("Configured storage server no longer exists", 404);
+    const subParts = ["", "storage", "servers", String(row.storage_server_id), "recordings", String(row.storage_recording_id), parts[3]];
+    return storageServersRoute(request, env, subParts, "GET", user);
+  }
+  return fail("Not found", 404);
 };
 
 const camerasRoute = async (request: Request, env: Env, parts: string[], method: string, user: any): Promise<Response> => {
@@ -470,7 +731,7 @@ const camerasRoute = async (request: Request, env: Env, parts: string[], method:
   if (parts.length === 2) {
     if (method === "GET") return json((await all(db, "SELECT * FROM cameras ORDER BY id")).map(cameraView));
     if (method === "POST") {
-      const data = await bodyOf(request);
+      const data = await normalizeCameraInput(env, await bodyOf(request));
       const host = String(data.host ?? "").trim();
       if (!host) return fail("RTSP IP / host is required");
       const name = String(data.name ?? "").trim() || `Camera ${host}`;
@@ -517,7 +778,7 @@ const camerasRoute = async (request: Request, env: Env, parts: string[], method:
   if (parts.length === 3) {
     if (method === "GET") return json(cameraView(camera));
     if (method === "PUT") {
-      const data = await bodyOf(request);
+      const data = await normalizeCameraInput(env, await bodyOf(request));
       const fields: Record<string, any> = {};
       for (const key of ["name", "location", "manufacturer", "model", "host", "port", "protocol", "rtsp_url", "onvif_url", "username", "main_stream", "sub_stream"]) {
         if (key in data) fields[key] = data[key];
@@ -545,11 +806,31 @@ const camerasRoute = async (request: Request, env: Env, parts: string[], method:
   }
 
   if (sub === "test" || sub === "test-draft") {
-    return json({ camera_id: id, status: "unreachable", message: "Live camera probing is not available in the Cloudflare-only deployment." });
+    const result = await cameraBridgeAction(env, camera, "/status");
+    const body: any = await result.json().catch(() => ({}));
+    const status = body.status === "online" || body.status === "recording" ? "reachable" : "unreachable";
+    return json({ camera_id: id, status, message: body.message || (status === "reachable" ? "Camera connected and streaming." : "Camera is not reachable."), resolution: body.resolution || null, fps: body.fps ?? null });
   }
   if (sub === "status") {
-    return json({ camera_id: id, status: "unknown", protocol: camera.protocol, resolution: null, fps: null, message: "Live camera status requires a local media service." });
+    const result = await cameraBridgeAction(env, camera, "/status");
+    const body: any = await result.json().catch(() => ({}));
+    return json({ camera_id: id, ...body, protocol: camera.protocol });
   }
+  if (sub === "recording" && parts[4] === "start" && method === "POST") {
+    await run(db, "UPDATE cameras SET recording_enabled=1, updated_at=? WHERE id=?", stamp(), id);
+    await audit(request, env, user, "camera.recording_started", String(id));
+    return cameraBridgeAction(env, camera, "/record/start", "POST", { name: camera.name });
+  }
+  if (sub === "recording" && parts[4] === "stop" && method === "POST") {
+    await run(db, "UPDATE cameras SET recording_enabled=0, updated_at=? WHERE id=?", stamp(), id);
+    await audit(request, env, user, "camera.recording_stopped", String(id));
+    return cameraBridgeAction(env, camera, "/record/stop", "POST");
+  }
+  if (sub === "recording" && parts[4] === "status") {
+    return cameraBridgeAction(env, camera, "/record/status");
+  }
+  if (sub === "stream.m3u8") return proxyHls(env, camera);
+  if (sub === "hls" && parts[4]) return proxyHls(env, camera, parts[4]);
   if (sub === "snapshot" || sub === "preview.jpg") return proxyMedia(request, env, camera, true);
   if (sub === "stream.mjpeg" || sub === "live") return proxyMedia(request, env, camera, false);
 
@@ -1113,6 +1394,12 @@ const route = async (request: Request, env: Env): Promise<Response> => {
     return json({ status: "ok", platform: "cloudflare" });
   }
   if (path === "/api/version") return json({ version: "0.1.0" });
+  if (path.startsWith("/api/bridge/")) {
+    if (!env.MEDIA_BRIDGE_TOKEN || request.headers.get("x-bridge-token") !== env.MEDIA_BRIDGE_TOKEN) return fail("Invalid bridge token", 401);
+    if (path === "/api/bridge/config" && method === "GET") return bridgeConfig(env);
+    if (path === "/api/bridge/recordings" && method === "POST") return bridgeRecordingUpsert(request, env);
+    return fail("Not found", 404);
+  }
   if (path === "/api/auth/login" && method === "POST") return login(request, env);
   if (path === "/api/auth/guest" && method === "POST") return guestLogin(request, env);
   if (method === "OPTIONS") return empty();
@@ -1180,13 +1467,7 @@ const route = async (request: Request, env: Env): Promise<Response> => {
     }
   }
 
-  if (path === "/api/recordings" && method === "GET") {
-    const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));
-    const pageSize = Math.max(1, Number(url.searchParams.get("page_size") ?? 25));
-    return json({ items: [], page, page_size: pageSize });
-  }
-  if (parts[1] === "recordings" && parts.length === 3 && method === "DELETE") return empty();
-  if (parts[1] === "recordings" && parts[3] === "file") return fail("Recordings require a local media service.", 501);
+  if (parts[1] === "recordings") return recordingsRoute(request, env, parts, method, url, user);
 
   if (path === "/api/events" || path === "/api/detections") {
     const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));

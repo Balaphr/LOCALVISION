@@ -22,3 +22,18 @@ export interface Camera {
 }
 
 export type CameraInput = Omit<Camera, "id" | "created_at" | "updated_at"> & { password?: string };
+
+export interface CameraStatus {
+  camera_id: number;
+  status: string;
+  message?: string | null;
+  resolution?: string | null;
+  fps?: number | null;
+  stream?: string;
+  recording?: string;
+  last_frame_at?: string | null;
+  last_error?: string | null;
+  restarts?: number;
+  restart_count?: number;
+  protocol?: string;
+}

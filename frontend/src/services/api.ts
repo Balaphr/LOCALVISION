@@ -1,4 +1,4 @@
-import type { Camera, CameraInput } from "../types/camera";
+import type { Camera, CameraInput, CameraStatus } from "../types/camera";
 import type { RecordingPage, Zone, ZoneInput } from "../types/recording";
 import type { AiStatus, AlertItem, DiscoveryResult, EventItem, Integration, IntegrationInput, Metrics } from "../types/operations";
 import type { LoginResponse, Role, Share, User, UserRecord } from "../types/auth";
@@ -26,10 +26,29 @@ export const cameraApi = {
   inspectOnvif: (endpoint: string, username?: string, password?: string) => request<DiscoveryResult>("/api/cameras/onvif/inspect", { method: "POST", body: JSON.stringify({ endpoint, username: username || null, password: password || null }) }),
   update: (id: number, input: Partial<CameraInput>) => request<Camera>(`/api/cameras/${id}`, { method: "PUT", body: JSON.stringify(input) }),
   remove: (id: number) => request<void>(`/api/cameras/${id}`, { method: "DELETE" }),
-  status: (id: number) => request<{ camera_id: number; status: string; protocol: string; resolution?: string | null; fps?: number | null; message?: string | null }>(`/api/cameras/${id}/status`),
-  snapshot: (id: number) => request<{ camera_id: number; status: string; path?: string; url?: string; message?: string }>(`/api/cameras/${id}/snapshot`),
+  status: (id: number) => request<CameraStatus>(`/api/cameras/${id}/status`),
+  test: (id: number) => request<{ camera_id: number; status: string; message?: string; resolution?: string | null; fps?: number | null }>(`/api/cameras/${id}/test`, { method: "POST" }),
+  snapshot: async (id: number) => {
+    const response = await fetch(`/api/cameras/${id}/snapshot`, { credentials: "include" });
+    if (!response.ok) {
+      const detail = (await response.json().catch(() => null))?.detail;
+      throw new Error(typeof detail === "string" ? detail : `Snapshot failed (${response.status})`);
+    }
+    const blob = await response.blob();
+    const href = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = `camera-${id}-${Date.now()}.jpg`;
+    link.click();
+    URL.revokeObjectURL(href);
+    return { status: "saved" as const };
+  },
   previewUrl: (id: number) => `/api/cameras/${id}/preview.jpg?t=${Date.now()}`,
-  streamUrl: (id: number) => `/api/cameras/${id}/stream.mjpeg`,
+  streamUrl: (id: number) => `/api/cameras/${id}/stream.m3u8`,
+  mjpegUrl: (id: number) => `/api/cameras/${id}/stream.mjpeg`,
+  recordStart: (id: number) => request<{ status: string; message?: string }>(`/api/cameras/${id}/recording/start`, { method: "POST" }),
+  recordStop: (id: number) => request<{ status: string; message?: string }>(`/api/cameras/${id}/recording/stop`, { method: "POST" }),
+  recordStatus: (id: number) => request<{ camera_id: number; status: string; last_error?: string | null; last_recording_at?: string | null; desired?: boolean }>(`/api/cameras/${id}/recording/status`),
   mediaUrl: (path: string) => `/api/media/file/${path}`
 };
 
