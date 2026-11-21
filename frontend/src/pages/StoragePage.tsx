@@ -27,6 +27,10 @@ export function StoragePage() {
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [playing, setPlaying] = useState<StorageRecording | null>(null);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadCamera, setUploadCamera] = useState("Camera1");
+  const [uploadDate, setUploadDate] = useState(new Date().toISOString().slice(0, 10));
+  const [uploading, setUploading] = useState(false);
 
   const load = async (silent = false) => {
     if (!silent) setLoading(true);
@@ -69,9 +73,9 @@ export function StoragePage() {
     try {
       let result: any;
       if (editing) {
-        result = await storageApi.update(editing, { name: form.name, endpoint: form.endpoint, ...(form.apiKey ? { api_key: form.apiKey } : {}) });
+        result = await storageApi.update(editing, { name: form.name, endpoint: form.endpoint, auth_method: "bearer", ...(form.apiKey ? { api_key: form.apiKey } : {}) });
       } else {
-        result = await storageApi.create({ name: form.name, kind: "remote_api", endpoint: form.endpoint, auth_method: "api_key", api_key: form.apiKey, enabled: true });
+        result = await storageApi.create({ name: form.name, kind: "remote_api", endpoint: form.endpoint, auth_method: "bearer", api_key: form.apiKey, enabled: true });
       }
       const state = result?.probe?.status ?? "unknown";
       setNotice(state === "online" ? "Ubuntu storage connected" : state === "warning" ? "Connected, but capacity data is incomplete" : result?.probe?.message ?? "Storage server saved");
@@ -109,6 +113,30 @@ export function StoragePage() {
     }
   };
 
+  const upload = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const server = overview?.servers.find(item => item.connection === "Connected") ?? overview?.servers[0];
+    if (!server || !uploadFile) return;
+    setUploading(true);
+    setError("");
+    setNotice("");
+    try {
+      const formData = new FormData();
+      formData.append("file", uploadFile);
+      formData.append("camera", uploadCamera);
+      formData.append("date", uploadDate);
+      const saved = await storageApi.upload(server.id, formData);
+      await load(true);
+      const verified = (await storageApi.recordings(server.id)).some(item => item.id === saved.id || item.name === saved.name);
+      setNotice(verified ? `${saved.name} uploaded and verified on Ubuntu storage` : `${saved.name} uploaded`);
+      setUploadFile(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not upload file");
+    } finally {
+      setUploading(false);
+    }
+  };
+
   if (!overview) return <div className="page-heading"><div><span className="eyebrow">Administration / storage</span><h1>Storage management</h1>{error && <div className="error-state" role="alert">{error}</div>}{loading && <p>Loading storage…</p>}</div></div>;
 
   const connected = overview.servers.filter(server => server.connection === "Connected").length;
@@ -137,6 +165,16 @@ export function StoragePage() {
           <div className="storage-actions"><button onClick={() => void test(server.id)}>Test connection</button><button onClick={() => openEdit(server)}>Edit</button><button onClick={() => void remove(server.id, server.name)}>Delete</button></div>
         </article>)}
       </div>
+    </section>
+
+    <section className="settings-panel">
+      <div className="section-title"><h2>Upload recording</h2><span>Saved on Ubuntu storage</span></div>
+      <form className="form-grid storage-upload-form" onSubmit={upload}>
+        <label>File<input required type="file" onChange={event => setUploadFile(event.target.files?.[0] ?? null)} /></label>
+        <label>Camera<input required value={uploadCamera} onChange={event => setUploadCamera(event.target.value)} /></label>
+        <label>Date<input required type="date" value={uploadDate} onChange={event => setUploadDate(event.target.value)} /></label>
+        <button className="primary" disabled={uploading || !overview.servers.length} type="submit">{uploading ? "Uploading…" : "Upload & verify"}</button>
+      </form>
     </section>
 
     <section className="settings-panel">

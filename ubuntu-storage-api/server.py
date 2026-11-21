@@ -19,7 +19,8 @@ VIDEO_SUFFIXES = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v"}
 
 
 def authorized(handler):
-    supplied = handler.headers.get("X-API-Key", "")
+    header = handler.headers.get("Authorization", "")
+    supplied = header[7:] if header.startswith("Bearer ") else handler.headers.get("X-API-Key", "")
     return bool(API_KEY) and hmac.compare_digest(supplied, API_KEY)
 
 
@@ -51,6 +52,40 @@ def resolve_id(value):
     if ROOT not in candidate.parents or not candidate.is_file():
         return None
     return candidate
+
+
+def read_multipart(handler):
+    length = int(handler.headers.get("Content-Length", "0") or 0)
+    content_type = handler.headers.get("Content-Type", "")
+    match = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', content_type)
+    if not match or length <= 0:
+        return {}
+    boundary = (match.group(1) or match.group(2)).strip().encode()
+    raw = handler.rfile.read(length)
+    fields = {}
+    for part in raw.split(b"--" + boundary)[1:-1]:
+        part = part.strip(b"\r\n")
+        header_blob, separator, body = part.partition(b"\r\n\r\n")
+        if not separator:
+            continue
+        name_match = re.search(rb'name="([^"]+)"', header_blob)
+        if not name_match:
+            continue
+        name = name_match.group(1).decode(errors="replace")
+        filename_match = re.search(rb'filename="([^"]*)"', header_blob)
+        filename = filename_match.group(1).decode(errors="replace") if filename_match else None
+        if body.endswith(b"\r\n"):
+            body = body[:-2]
+        fields[name] = {"filename": filename, "body": body}
+    return fields
+
+
+def safe_upload_path(camera, date, filename):
+    camera = re.sub(r"[^A-Za-z0-9_.-]+", "_", camera or "Camera1").strip("._") or "Camera1"
+    date = re.sub(r"[^0-9-]+", "", date or datetime.now(timezone.utc).strftime("%Y-%m-%d")) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    filename = Path(filename or "recording.mp4").name
+    filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename).strip("._") or "recording.mp4"
+    return ROOT / "recordings" / camera / date / filename
 
 
 def recording_entries():
@@ -168,6 +203,15 @@ class StorageHandler(BaseHTTPRequestHandler):
         if path == "/api/recordings":
             send_json(self, 200, {"files": recording_entries()})
             return
+        if path.startswith("/api/recordings/file/"):
+            parts = path.split("/")
+            if len(parts) == 8 and parts[7] in {"file", "download"}:
+                target = safe_upload_path(unquote(parts[4]), unquote(parts[5]), unquote(parts[6]))
+                if not target.is_file():
+                    send_json(self, 404, {"detail": "Recording not found"})
+                    return
+                stream_file(self, target, download=parts[7] == "download")
+                return
         if path.startswith("/api/recordings/"):
             parts = path.split("/")
             if len(parts) == 5 and parts[4] in {"file", "download"}:
@@ -178,6 +222,41 @@ class StorageHandler(BaseHTTPRequestHandler):
                 stream_file(self, target, download=parts[4] == "download")
                 return
         send_json(self, 404, {"detail": "Not found"})
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        if not authorized(self):
+            send_json(self, 401, {"detail": "Not authenticated"})
+            return
+        if path != "/api/storage/upload":
+            send_json(self, 404, {"detail": "Not found"})
+            return
+        fields = read_multipart(self)
+        upload = fields.get("file")
+        if not upload or not upload.get("filename"):
+            send_json(self, 422, {"detail": "A file is required"})
+            return
+        target = safe_upload_path(
+            fields.get("camera", {}).get("body", b"Camera1").decode(errors="replace"),
+            fields.get("date", {}).get("body", b"").decode(errors="replace"),
+            upload["filename"]
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(upload["body"])
+        stat = target.stat()
+        relative = target.relative_to(ROOT)
+        send_json(self, 201, {
+            "id": encode_id(relative),
+            "camera": target.parent.parent.name,
+            "date": target.parent.name,
+            "filename": target.name,
+            "name": target.name,
+            "path": str(relative),
+            "size_bytes": stat.st_size,
+            "created_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            "mime_type": mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        })
 
     def do_HEAD(self):
         parsed = urlparse(self.path)

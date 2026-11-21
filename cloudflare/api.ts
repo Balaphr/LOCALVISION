@@ -764,10 +764,17 @@ const storageFetch = async (env: Env, item: any, subPath: string, init: RequestI
   const secret = await decryptSecret(item.secret_enc, env.ENCRYPTION_KEY || env.SECRET_KEY);
   const headers = new Headers(init.headers || {});
   if (!headers.has("Accept")) headers.set("Accept", "application/json");
-  if (secret) {
-    if (item.auth_method === "bearer") headers.set("Authorization", `Bearer ${secret}`);
-    else if (item.auth_method === "basic") headers.set("Authorization", `Basic ${secret}`);
-    else headers.set("X-API-Key", secret);
+  if (item.auth_method === "none") {
+    if (secret) headers.set("X-API-Key", secret);
+  } else if (!secret) {
+    throw new Error("Storage API key is missing or could not be decrypted; re-enter it");
+  } else if (item.auth_method === "bearer") {
+    headers.set("Authorization", `Bearer ${secret}`);
+  } else if (item.auth_method === "basic") {
+    headers.set("Authorization", `Basic ${secret}`);
+  } else {
+    headers.set("Authorization", `Bearer ${secret}`);
+    headers.set("X-API-Key", secret);
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
@@ -818,16 +825,53 @@ const probeStorage = async (env: Env, item: any, persist = false) => {
   }
 };
 
-const normalizeRecording = (entry: any) => ({
-  id: String(entry?.id ?? entry?.file_id ?? ""),
-  camera_id: Number(entry?.camera_id ?? entry?.camera ?? 0) || null,
-  name: String(entry?.name ?? entry?.filename ?? entry?.path ?? "Recording"),
-  path: String(entry?.path ?? ""),
-  size_bytes: Number(entry?.size_bytes ?? entry?.size ?? 0) || 0,
-  created_at: entry?.created_at ?? entry?.mtime ?? null,
-  duration_seconds: entry?.duration_seconds ?? entry?.duration ?? null,
-  mime_type: String(entry?.mime_type ?? "video/mp4")
-});
+const storageText = (...values: any[]): string => {
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return "";
+};
+
+const normalizeRecording = (entry: any, defaults: any = {}) => {
+  const raw = typeof entry === "string" ? { filename: entry } : entry ?? {};
+  const path = storageText(raw.path, raw.file_path, raw.file, raw.filename, raw.name, raw.id, defaults.path);
+  const filename = storageText(raw.filename, raw.name, raw.file, path.split(/[\\/]/).pop()) || "Recording";
+  const camera = storageText(raw.camera, raw.camera_name, raw.camera_id, defaults.camera, defaults.camera_name, defaults.camera_id) || "Camera1";
+  const createdRaw = storageText(raw.created_at, raw.mtime, raw.timestamp);
+  const date = storageText(raw.date, raw.day, defaults.date, defaults.day) || (createdRaw ? createdRaw.slice(0, 10) : new Date().toISOString().slice(0, 10));
+  const numericCamera = Number(raw.camera_id ?? defaults.camera_id);
+  const cameraId = Number.isFinite(numericCamera) && numericCamera > 0 ? numericCamera : null;
+  const liveStyle = Boolean(storageText(raw.filename, raw.file, raw.name) && date && camera);
+  const id = liveStyle ? `${camera}|${date}|${filename}` : storageText(raw.id, raw.file_id, path);
+  return {
+    id,
+    camera_id: cameraId,
+    camera,
+    date,
+    filename,
+    name: filename,
+    path,
+    size_bytes: Number(raw.size_bytes ?? raw.size ?? raw.bytes ?? 0) || 0,
+    created_at: createdRaw || (date ? `${date}T00:00:00.000Z` : null),
+    duration_seconds: raw.duration_seconds ?? raw.duration ?? null,
+    mime_type: storageText(raw.mime_type, raw.content_type) || "video/mp4"
+  };
+};
+
+const storageRecordings = (payload: any): any[] => {
+  let items = payload;
+  if (!Array.isArray(items)) {
+    if (Array.isArray(payload?.files)) items = payload.files;
+    else if (Array.isArray(payload?.recordings)) items = payload.recordings;
+    else if (Array.isArray(payload?.items)) items = payload.items;
+    else if (Array.isArray(payload?.data)) items = payload.data;
+    else return [];
+  }
+  const defaults = Array.isArray(payload) ? {} : payload ?? {};
+  return items.map((item: any) => normalizeRecording(item, defaults)).filter((item: any) => item.id);
+};
 
 const storageServersRoute = async (request: Request, env: Env, parts: string[], method: string, user: any): Promise<Response> => {
   const db = env.DB;
@@ -841,6 +885,7 @@ const storageServersRoute = async (request: Request, env: Env, parts: string[], 
       if (!apiKey) return fail("API key is required", 422);
       if (apiKey.length > 500) return fail("API key is too long", 422);
       const endpoint = storageBaseUrl(endpointRaw);
+      const authMethod = ["none", "bearer", "basic", "api_key"].includes(String(data.auth_method)) ? String(data.auth_method) : "bearer";
       await run(
         db,
         "INSERT INTO storage_servers (name,kind,endpoint,base_path,bucket,region,auth_method,secret_enc,enabled,last_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -850,7 +895,7 @@ const storageServersRoute = async (request: Request, env: Env, parts: string[], 
         null,
         null,
         null,
-        "api_key",
+        authMethod,
         await encryptSecret(apiKey, env.ENCRYPTION_KEY || env.SECRET_KEY),
         data.enabled === false ? 0 : 1,
         "unknown",
@@ -884,19 +929,26 @@ const storageServersRoute = async (request: Request, env: Env, parts: string[], 
       } catch {
         return fail("Storage API did not return valid recording JSON", 502);
       }
-      const items = Array.isArray(payload) ? payload : payload.files ?? payload.recordings ?? payload.data ?? [];
-      if (!Array.isArray(items)) return fail("Storage API recording list must be an array", 502);
-      return json(items.map(normalizeRecording).filter((entry: any) => entry.id));
+      return json(storageRecordings(payload));
     } catch (error: any) {
       return fail(error?.message || "Could not load recordings", 502);
     }
   }
 
   if (parts[4] === "recordings" && parts[5] && ["file", "download"].includes(parts[6]) && method === "GET") {
-    const subPath = `api/recordings/${encodeURIComponent(parts[5])}/${parts[6]}`;
+    const fileId = decodeURIComponent(parts[5]);
+    const liveParts = fileId.split("|");
+    const liveStyle = liveParts.length === 3;
+    const primaryPath = liveStyle
+      ? `api/recordings/file/${encodeURIComponent(liveParts[0])}/${encodeURIComponent(liveParts[1])}/${encodeURIComponent(liveParts[2])}`
+      : `api/recordings/${encodeURIComponent(fileId)}/${parts[6]}`;
     const range = request.headers.get("range");
     try {
-      const response = await storageFetch(env, item, subPath, { headers: range ? { Range: range } : {} });
+      let response = await storageFetch(env, item, primaryPath, { headers: range ? { Range: range } : {} });
+      if (liveStyle && response.status === 404) {
+        if (response.body) await response.body.cancel().catch(() => {});
+        response = await storageFetch(env, item, `${primaryPath}/${parts[6]}`, { headers: range ? { Range: range } : {} });
+      }
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
         return fail(`Storage API returned HTTP ${response.status}: ${detail.slice(0, 500)}`, 502);
@@ -906,9 +958,36 @@ const storageServersRoute = async (request: Request, env: Env, parts: string[], 
         const value = response.headers.get(key);
         if (value) headers[key] = value;
       }
+      if (parts[6] === "download" && !headers["content-disposition"]) {
+        headers["content-disposition"] = `attachment; filename="${(liveStyle ? liveParts[2] : fileId).replace(/"/g, "")}"`;
+      }
       return new Response(response.body, { status: response.status, headers });
     } catch (error: any) {
       return fail(error?.message || "Could not stream recording", 502);
+    }
+  }
+
+  if (parts[4] === "upload" && method === "POST") {
+    try {
+      const form = await request.formData();
+      const file = form.get("file");
+      if (!file || typeof file === "string") return fail("Choose a file to upload", 422);
+      const camera = String(form.get("camera") ?? form.get("camera_id") ?? "Camera1").trim() || "Camera1";
+      const date = String(form.get("date") ?? "").trim() || new Date().toISOString().slice(0, 10);
+      const payload = new FormData();
+      payload.append("file", file, file.name);
+      payload.append("camera", camera);
+      payload.append("date", date);
+      const response = await storageFetch(env, item, "api/storage/upload", { method: "POST", body: payload });
+      const text = await response.text();
+      if (!response.ok) return fail(`Storage API returned HTTP ${response.status}: ${text.slice(0, 500)}`, 502);
+      let saved: any;
+      try { saved = JSON.parse(text); } catch { return fail("Storage API did not return valid upload JSON", 502); }
+      const recording = normalizeRecording(saved.record ?? saved.file ?? saved, { camera, date });
+      await audit(request, env, user, "storage.uploaded", String(id));
+      return json({ ...recording, server_id: id, server_name: item.name, fileUrl: `/api/storage/servers/${id}/recordings/${encodeURIComponent(recording.id)}/file`, downloadUrl: `/api/storage/servers/${id}/recordings/${encodeURIComponent(recording.id)}/download` }, 201);
+    } catch (error: any) {
+      return fail(error?.message || "Could not upload file", 502);
     }
   }
 
@@ -922,6 +1001,11 @@ const storageServersRoute = async (request: Request, env: Env, parts: string[], 
       fields.endpoint = storageBaseUrl(endpoint);
     }
     if ("enabled" in data) fields.enabled = data.enabled ? 1 : 0;
+    if ("auth_method" in data) {
+      const authMethod = String(data.auth_method);
+      if (!["none", "bearer", "basic", "api_key"].includes(authMethod)) return fail("Unsupported storage authentication method", 422);
+      fields.auth_method = authMethod;
+    }
     const apiKey = String(data.api_key ?? data.secret ?? "");
     if (apiKey) {
       if (apiKey.length > 500) return fail("API key is too long", 422);
@@ -967,12 +1051,8 @@ const storageOverview = async (env: Env): Promise<Response> => {
         const response = await storageFetch(env, row, "api/recordings");
         if (response.ok) {
           const payload: any = await response.json().catch(() => []);
-          const items = Array.isArray(payload) ? payload : payload.files ?? payload.recordings ?? payload.data ?? [];
-          if (Array.isArray(items)) {
-            for (const item of items) {
-              const recording = normalizeRecording(item);
-              recordings.push({ ...recording, server_id: row.id, server_name: row.name, fileUrl: `/api/storage/servers/${row.id}/recordings/${encodeURIComponent(recording.id)}/file`, downloadUrl: `/api/storage/servers/${row.id}/recordings/${encodeURIComponent(recording.id)}/download` });
-            }
+          for (const recording of storageRecordings(payload)) {
+            recordings.push({ ...recording, server_id: row.id, server_name: row.name, fileUrl: `/api/storage/servers/${row.id}/recordings/${encodeURIComponent(recording.id)}/file`, downloadUrl: `/api/storage/servers/${row.id}/recordings/${encodeURIComponent(recording.id)}/download` });
           }
         }
       } catch {}

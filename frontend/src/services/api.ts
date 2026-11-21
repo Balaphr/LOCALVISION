@@ -6,7 +6,7 @@ import type { StorageIntegration, StorageIntegrationInput, StorageOverview, Stor
 
 const request = async <T>(path: string, options?: RequestInit): Promise<T> => {
   const headers = new Headers(options?.headers);
-  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  if (!(options?.body instanceof FormData) && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const response = await fetch(path, { ...options, headers, credentials: "include" });
   if (!response.ok) {
     const detail = (await response.json().catch(() => null))?.detail;
@@ -101,7 +101,8 @@ export const storageApi = {
   update: (id: number, input: Partial<StorageIntegrationInput>) => request<StorageIntegration>(`/api/storage/servers/${id}`, { method: "PATCH", body: JSON.stringify(input) }),
   remove: (id: number) => request<void>(`/api/storage/servers/${id}`, { method: "DELETE" }),
   test: (id: number) => request<StorageProbe>(`/api/storage/servers/${id}/test`, { method: "POST" }),
-  recordings: (id: number) => request<StorageRecording[]>(`/api/storage/servers/${id}/recordings`)
+  recordings: (id: number) => request<StorageRecording[]>(`/api/storage/servers/${id}/recordings`),
+  upload: (id: number, formData: FormData) => request<StorageRecording>(`/api/storage/servers/${id}/upload`, { method: "POST", body: formData })
 };
 
 export const settingsApi = { get: () => request<{ version: string; environment: string; storage_path: string; secrets_configured: boolean }>("/api/settings") };
