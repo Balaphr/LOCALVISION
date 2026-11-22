@@ -14,38 +14,124 @@ export function HlsPlayer({ src, className }: Props) {
     const video = videoRef.current;
     if (!video) return;
     let hls: Hls | null = null;
+    let active = true;
     let retries = 0;
-    setError("");
+    let reloadTimer: number | null = null;
+    let stallTimer: number | null = null;
+    let lastTime = -1;
+    let lastProgress = Date.now();
 
-    if (video.canPlayType("application/vnd.apple.mpegurl")) {
-      video.src = src;
-    } else if (Hls.isSupported()) {
-      hls = new Hls({ lowLatencyMode: true, backBufferLength: 30, enableWorker: true });
+    const clearReload = () => {
+      if (reloadTimer === null) return;
+      window.clearTimeout(reloadTimer);
+      reloadTimer = null;
+    };
+
+    const destroyHls = () => {
+      hls?.destroy();
+      hls = null;
+    };
+
+    const play = () => {
+      void video.play().catch(() => undefined);
+    };
+
+    const reconnect = () => {
+      if (!active || reloadTimer !== null) return;
+      retries += 1;
+      setError("Reconnecting…");
+      clearReload();
+      reloadTimer = window.setTimeout(() => {
+        reloadTimer = null;
+        destroyHls();
+        video.removeAttribute("src");
+        video.load();
+        start();
+      }, Math.min(8000, 500 * retries));
+    };
+
+    const start = () => {
+      if (!active) return;
+      setError("");
+      lastTime = -1;
+      lastProgress = Date.now();
+      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.src = src;
+        video.onerror = () => reconnect();
+        play();
+        return;
+      }
+      if (!Hls.isSupported()) {
+        setError("HLS is not supported by this browser");
+        return;
+      }
+      hls = new Hls({
+        lowLatencyMode: true,
+        backBufferLength: 10,
+        enableWorker: true,
+        manifestLoadingMaxRetry: 6,
+        manifestLoadingRetryDelay: 500,
+        levelLoadingMaxRetry: 6,
+        levelLoadingRetryDelay: 500,
+        fragLoadingMaxRetry: 6,
+        fragLoadingRetryDelay: 500,
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 8,
+        maxLiveSyncPlaybackRate: 1.5
+      });
       hls.loadSource(src);
       hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        retries = 0;
+        lastProgress = Date.now();
+        setError("");
+        play();
+      });
+      hls.on(Hls.Events.FRAG_LOADED, () => {
+        lastProgress = Date.now();
+      });
       hls.on(Hls.Events.ERROR, (_event, data) => {
         if (!data.fatal) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && retries < 3) {
-          retries += 1;
-          window.setTimeout(() => hls?.startLoad(), 1500 * retries);
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && retries < 3) {
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && retries < 2) {
           retries += 1;
           hls?.recoverMediaError();
-        } else {
-          setError("Live stream unavailable");
+          play();
+          return;
         }
+        reconnect();
       });
-    } else {
-      setError("HLS is not supported by this browser");
-    }
+    };
 
-    void video.play().catch(() => undefined);
+    const onPlaying = () => {
+      retries = 0;
+      lastProgress = Date.now();
+      setError("");
+    };
+
+    video.addEventListener("playing", onPlaying);
+    start();
+    stallTimer = window.setInterval(() => {
+      if (document.hidden || video.paused || video.ended) return;
+      const current = video.currentTime;
+      if (Number.isFinite(current) && current > lastTime + 0.05) {
+        lastTime = current;
+        lastProgress = Date.now();
+        return;
+      }
+      if (Date.now() - lastProgress > 10000) reconnect();
+    }, 2000);
+
     return () => {
-      hls?.destroy();
+      active = false;
+      clearReload();
+      if (stallTimer !== null) window.clearInterval(stallTimer);
+      video.removeEventListener("playing", onPlaying);
+      video.onerror = null;
+      destroyHls();
       video.removeAttribute("src");
       video.load();
     };
   }, [src]);
 
-  return <div className="hls-wrap"><video ref={videoRef} className={className} autoPlay muted playsInline controls />{error && <div className="stream-error">{error}</div>}</div>;
+  return <div className="hls-wrap"><video ref={videoRef} className={className} autoPlay muted playsInline />{error && <div className="stream-error">{error}</div>}</div>;
 }

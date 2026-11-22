@@ -743,19 +743,31 @@ const bridgeRecordingUpsert = async (request: Request, env: Env): Promise<Respon
     startedAt,
     endedAt
   ];
+  const existing = recordingId
+    ? await first(env.DB, "SELECT * FROM camera_recordings WHERE storage_recording_id=?", recordingId)
+    : await first(env.DB, "SELECT * FROM camera_recordings WHERE camera_id=? AND filename=? ORDER BY id DESC LIMIT 1", cameraId, String(data.filename ?? "recording.mp4"));
+  if (existing) {
+    await run(
+      env.DB,
+      `UPDATE camera_recordings SET camera_id=?,storage_server_id=?,storage_recording_id=?,name=?,camera=?,date=?,time=?,filename=?,
+       duration_seconds=?,size_bytes=?,status=?,started_at=?,ended_at=?,updated_at=? WHERE id=?`,
+      ...values,
+      stamp(),
+      existing.id
+    );
+    return json({ id: Number(existing.id) }, 200);
+  }
   await run(
     env.DB,
     `INSERT INTO camera_recordings (camera_id,storage_server_id,storage_recording_id,name,camera,date,time,filename,duration_seconds,size_bytes,status,started_at,ended_at,created_at,updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-     ON CONFLICT(storage_recording_id) DO UPDATE SET
-       storage_server_id=excluded.storage_server_id,name=excluded.name,camera=excluded.camera,date=excluded.date,time=excluded.time,
-       filename=excluded.filename,duration_seconds=excluded.duration_seconds,size_bytes=excluded.size_bytes,status=excluded.status,
-       started_at=excluded.started_at,ended_at=excluded.ended_at,updated_at=excluded.updated_at`,
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ...values,
     stamp(),
     stamp()
   );
-  const saved = recordingId ? await first(env.DB, "SELECT * FROM camera_recordings WHERE storage_recording_id=?", recordingId) : await first(env.DB, "SELECT * FROM camera_recordings ORDER BY id DESC LIMIT 1");
+  const saved = recordingId
+    ? await first(env.DB, "SELECT * FROM camera_recordings WHERE storage_recording_id=?", recordingId)
+    : await first(env.DB, "SELECT * FROM camera_recordings WHERE camera_id=? AND filename=? ORDER BY id DESC LIMIT 1", cameraId, String(data.filename ?? "recording.mp4"));
   return json({ id: Number(saved?.id ?? 0) }, 201);
 };
 

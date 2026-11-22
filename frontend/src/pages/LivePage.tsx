@@ -4,7 +4,7 @@ import type { RealtimeMessage } from "../hooks/useRealtime";
 import { HlsPlayer } from "../components/HlsPlayer";
 import { cameraApi } from "../services/api";
 
-const layouts = [1, 2, 4, 6, 9, 16];
+const layoutOptions = [0, 1, 2, 3, 4];
 
 interface Props {
   cameras: Camera[];
@@ -48,7 +48,7 @@ const streamLabel = (status?: CameraStatus) => {
 };
 
 export function LivePage({ cameras, detections }: Props) {
-  const [layout, setLayout] = useState(4);
+  const [layout, setLayout] = useState(0);
   const [selected, setSelected] = useState<number | null>(null);
   const [zoom, setZoom] = useState(1);
   const [notice, setNotice] = useState("");
@@ -56,7 +56,8 @@ export function LivePage({ cameras, detections }: Props) {
   const [recordings, setRecordings] = useState<Record<number, RecordingState>>({});
   const [busy, setBusy] = useState<Record<number, boolean>>({});
   const timer = useRef<number | null>(null);
-  const visible = useMemo(() => cameras.slice(0, layout), [cameras, layout]);
+  const visible = useMemo(() => cameras.filter(camera => camera.enabled), [cameras]);
+  const columns = layout || Math.min(visible.length || 1, Math.max(1, Math.ceil(Math.sqrt(visible.length || 1))));
 
   const refresh = useCallback(async () => {
     const entries = await Promise.all(cameras.filter(camera => camera.enabled).map(async camera => {
@@ -70,20 +71,20 @@ export function LivePage({ cameras, detections }: Props) {
     const recordingMap: Record<number, RecordingState> = {};
     for (const entry of entries) {
       if (entry.status) statusMap[entry.id] = entry.status;
-      recordingMap[entry.id] = {
-        status: entry.recording?.status ?? "unknown",
-        desired: entry.recording?.desired ?? false,
-        last_error: entry.recording?.last_error ?? null,
-        last_recording_at: entry.recording?.last_recording_at ?? null
+      if (entry.recording) recordingMap[entry.id] = {
+        status: entry.recording.status ?? "unknown",
+        desired: entry.recording.desired ?? false,
+        last_error: entry.recording.last_error ?? null,
+        last_recording_at: entry.recording.last_recording_at ?? null
       };
     }
-    setStatuses(previous => ({ ...previous, ...statusMap }));
-    setRecordings(previous => ({ ...previous, ...recordingMap }));
+    setStatuses(statusMap);
+    setRecordings(recordingMap);
   }, [cameras]);
 
   useEffect(() => {
-    if (!selected && cameras[0]) setSelected(cameras[0].id);
-  }, [cameras, selected]);
+    if (visible.length && !visible.some(camera => camera.id === selected)) setSelected(visible[0].id);
+  }, [visible, selected]);
 
   useEffect(() => {
     void refresh();
@@ -119,15 +120,15 @@ export function LivePage({ cameras, detections }: Props) {
   return <>
     <div className="page-heading">
       <div><span className="eyebrow">Operations / live</span><h1>Live view</h1><p>Real RTSP camera streams with recording controls.</p></div>
-      <div className="layout-picker" aria-label="Camera grid layout">{layouts.map(size => <button className={layout === size ? "active" : ""} key={size} onClick={() => setLayout(size)}>{size}</button>)}</div>
+      <div className="layout-picker" aria-label="Camera grid columns">{layoutOptions.map(size => <button className={layout === size ? "active" : ""} key={size} onClick={() => setLayout(size)}>{size === 0 ? "Auto" : `${size} col`}</button>)}</div>
     </div>
     {notice && <div className="notice inline-notice" onClick={() => setNotice("")}>{notice}</div>}
     <div className="live-toolbar">
-      <span><i className="status-dot" /> {cameras.filter(camera => camera.enabled).length} enabled</span>
+      <span><i className="status-dot" /> {visible.length} enabled</span>
       <span>{detections.length} recent AI detections</span>
       <label>Zoom <input type="range" min={1} max={2} step={0.1} value={zoom} onChange={event => setZoom(Number(event.target.value))} /></label>
     </div>
-    <div className={`live-grid live-grid-${layout}`}>
+    <div className="live-grid live-grid-auto" style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}>
       {visible.map(camera => {
         const cameraDetections = detections.filter(message => message.camera_id === camera.id);
         const status = statuses[camera.id];
@@ -154,7 +155,7 @@ export function LivePage({ cameras, detections }: Props) {
           </div>
         </article>;
       })}
-      {!cameras.length && <div className="empty-state">Add a camera to start live monitoring.</div>}
+      {!visible.length && <div className="empty-state">Enable a camera to start live monitoring.</div>}
     </div>
   </>;
 }

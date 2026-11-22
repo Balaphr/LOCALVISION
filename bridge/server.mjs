@@ -1,6 +1,6 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, statSync, existsSync, unlinkSync, renameSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, existsSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import ffmpegPath from "ffmpeg-static";
@@ -65,6 +65,7 @@ const getSession = (id, camera) => {
       recordStatus: "stopped",
       recordError: "",
       recordRestarts: 0,
+      recordGeneration: 0,
       lastRecordingAt: null
     };
     sessions.set(Number(id), session);
@@ -76,7 +77,13 @@ const getSession = (id, camera) => {
 const startHls = (session) => {
   const camera = session.camera;
   if (!camera?.enabled || !camera.source) return;
-  if (session.hlsProcess && session.hlsProcess.exitCode === null && session.hlsSource === camera.source) return;
+  if (session.hlsProcess && session.hlsProcess.exitCode === null && session.hlsSource !== camera.source) stopHls(session);
+  if (session.hlsStarting && session.hlsSource !== camera.source) {
+    session.hlsProcess?.kill("SIGTERM");
+    session.hlsProcess = null;
+    session.hlsStarting = false;
+  }
+  if (session.hlsProcess && session.hlsProcess.exitCode === null) return;
   if (session.hlsStarting) return;
   session.hlsStarting = true;
   session.hlsSource = camera.source;
@@ -119,6 +126,7 @@ const startHls = (session) => {
 
 const stopHls = (session) => {
   session.hlsSource = "";
+  session.hlsStarting = false;
   session.hlsStatus = "stopped";
   if (session.hlsProcess && session.hlsProcess.exitCode === null) session.hlsProcess.kill("SIGTERM");
   session.hlsProcess = null;
@@ -139,6 +147,8 @@ const reportRecording = async (metadata) => {
     signal: AbortSignal.timeout(20000)
   });
   if (!response.ok) throw new Error(`Recording index failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
+  const data = await response.json().catch(() => ({}));
+  return data.id ? Number(data.id) : null;
 };
 
 const uploadRecording = async (item) => {
@@ -152,18 +162,20 @@ const uploadRecording = async (item) => {
   form.append("duration_seconds", String(item.metadata.duration_seconds));
   const headers = new Headers();
   applyStorageAuth(headers, storageConfig);
-  const response = await fetch(`${storageConfig.endpoint.replace(/\/+$/, "")}/api/storage/upload`, {
-    method: "POST",
-    headers,
-    body: form,
-    signal: AbortSignal.timeout(120000)
-  });
+  const target = `${storageConfig.endpoint.replace(/\/+$/, "")}/api/storage/upload`;
+  let response = await fetch(target, { method: "POST", headers, body: form, redirect: "manual", signal: AbortSignal.timeout(120000) });
+  if ([301, 302, 303, 307, 308].includes(response.status)) {
+    const location = response.headers.get("location");
+    if (!location) throw new Error(`Storage upload redirected without a target (${response.status})`);
+    response = await fetch(new URL(location, target).toString(), { method: "POST", headers, body: form, signal: AbortSignal.timeout(120000) });
+  }
   if (!response.ok) throw new Error(`Storage upload failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
   const saved = await response.json();
   await reportRecording({
     ...item.metadata,
     storage_server_id: storageConfig.id,
-    storage_recording_id: saved.id || item.metadata.storage_recording_id
+    storage_recording_id: saved.id || item.metadata.storage_recording_id,
+    status: "ready"
   });
   unlinkSync(item.file);
 };
@@ -208,43 +220,53 @@ const recordChunk = async (session, source, file) => {
   });
 };
 
-const recordLoop = async (session) => {
-  while (session.recordDesired && session.camera?.source) {
+const recordLoop = async (session, generation) => {
+  while (session.recordDesired && session.recordGeneration === generation && session.camera?.source) {
     const camera = session.camera;
-    const now = newDate();
-    const date = datePart(now);
-    const time = timePart(now);
+    const started = newDate();
+    const date = datePart(started);
+    const time = timePart(started);
     const filename = `${safeName(camera.name)}_${date}_${time.replace(/:/g, "-")}.mp4`;
     const dir = path.join(recordingRoot, "recordings", safeName(camera.name), date);
     mkdirSync(dir, { recursive: true });
     const file = path.join(dir, filename);
+    const metadata = {
+      camera_id: camera.id,
+      name: safeName(camera.name),
+      camera: safeName(camera.name),
+      date,
+      time,
+      filename,
+      duration_seconds: null,
+      size_bytes: 0,
+      status: "recording",
+      started_at: started.toISOString(),
+      ended_at: null
+    };
     try {
+      await reportRecording(metadata).catch(() => null);
       const result = await recordChunk(session, camera.source, file);
       if (session.recordProcess) session.recordProcess = null;
+      if (session.recordGeneration !== generation) {
+        if (existsSync(file)) unlinkSync(file);
+        return;
+      }
       const size = existsSync(file) ? statSync(file).size : 0;
       if (result.code === 0 && size > 0) {
         const durationSeconds = Math.min(segmentSeconds, Math.max(1, Math.round((Date.now() - result.started) / 1000)));
-        const finalFilename = `${safeName(camera.name)}_${date}_${time.replace(/:/g, "-")}_${durationSeconds}s.mp4`;
-        const finalFile = path.join(dir, finalFilename);
-        if (file !== finalFile) renameSync(file, finalFile);
-        const metadata = {
-          camera_id: camera.id,
-          name: safeName(camera.name),
-          camera: safeName(camera.name),
-          date,
-          time,
-          filename: finalFilename,
-          duration_seconds: durationSeconds,
-          size_bytes: size,
-          status: "ready",
-          started_at: new Date(result.started).toISOString(),
-          ended_at: new Date().toISOString()
-        };
+        metadata.duration_seconds = durationSeconds;
+        metadata.size_bytes = size;
+        metadata.ended_at = new Date().toISOString();
         session.lastRecordingAt = metadata.ended_at;
         session.recordStatus = "recording";
         session.recordError = "";
-        await queueUpload(session, camera, finalFile, metadata);
+        await queueUpload(session, camera, file, metadata);
       } else {
+        metadata.duration_seconds = 0;
+        metadata.size_bytes = size;
+        metadata.status = "error";
+        metadata.ended_at = new Date().toISOString();
+        await reportRecording(metadata).catch(() => null);
         session.recordStatus = "reconnecting";
         session.recordError = result.stderr || `Recording failed (${result.code})`;
         session.recordRestarts += 1;
@@ -254,20 +276,22 @@ const recordLoop = async (session) => {
       session.recordStatus = "error";
       session.recordError = error instanceof Error ? error.message : "Recording failed";
     }
-    if (session.recordDesired) await new Promise(resolve => setTimeout(resolve, 2000));
+    if (session.recordDesired && session.recordGeneration === generation) await new Promise(resolve => setTimeout(resolve, 2000));
   }
 };
 
 const startRecording = (session) => {
   if (!session.camera?.source) throw new Error("No RTSP source is configured for this camera");
   if (session.recordDesired && session.recordStatus !== "stopped") return;
+  session.recordGeneration += 1;
   session.recordDesired = true;
   session.recordStatus = "starting";
   session.recordError = "";
-  void recordLoop(session);
+  void recordLoop(session, session.recordGeneration);
 };
 
 const stopRecording = (session) => {
+  session.recordGeneration += 1;
   session.recordDesired = false;
   session.recordStatus = "stopped";
   if (session.recordProcess && session.recordProcess.exitCode === null) {

@@ -44,7 +44,7 @@ export function RecordingsPage({ cameras }: { cameras: Camera[] }) {
         {!loading && !items.length && <div className="empty-state">No recordings for this filter.</div>}
         {items.map(item => <button className={`recording-row ${selected?.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => setSelected(item)}>
           <span className="recording-kind">{item.kind}</span>
-          <span><b>{item.camera ?? cameras.find(camera => camera.id === item.camera_id)?.name ?? `Camera ${item.camera_id}`}</b><small>{new Date(item.started_at).toLocaleString()} · {item.duration_seconds ? `${Math.round(item.duration_seconds / 60)} min` : "active"}</small></span>
+          <span><b>{item.camera ?? cameras.find(camera => camera.id === item.camera_id)?.name ?? `Camera ${item.camera_id}`}</b><small>{new Date(item.started_at).toLocaleString()} · {item.duration_seconds ? `${Math.round(item.duration_seconds / 60)} min` : "active"} · {(Number(item.size_bytes || 0) / 1048576).toFixed(1)} MB</small></span>
           <span className="recording-status">{item.status}</span>
         </button>)}
       </section>
@@ -56,7 +56,7 @@ export function RecordingsPage({ cameras }: { cameras: Camera[] }) {
             <input aria-label="Seek recording" type="range" min={0} max={selected.duration_seconds ?? 600} defaultValue={0} onChange={event => { if (video.current) video.current.currentTime = Number(event.target.value); }} />
             <select value={speed} onChange={event => setSpeed(Number(event.target.value))}><option value={0.5}>0.5x</option><option value={1}>1x</option><option value={2}>2x</option><option value={4}>4x</option></select>
           </div>
-          <div className="recording-meta"><span>{selected.name ?? selected.filename}</span>{selected.downloadUrl && <a className="button-link" href={selected.downloadUrl}>Download</a>}</div>
+          <div className="recording-meta"><span>{selected.name ?? selected.filename} · {new Date(selected.started_at).toLocaleString()} · {selected.duration_seconds ? `${Math.round(selected.duration_seconds / 60)} min` : "active"} · {(Number(selected.size_bytes || 0) / 1048576).toFixed(1)} MB · {selected.status}</span>{selected.downloadUrl && <a className="button-link" href={selected.downloadUrl}>Download</a>}</div>
         </> : <div className="empty-state">Select a recording to play.</div>}
       </section>
     </div>
