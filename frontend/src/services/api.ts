@@ -3,6 +3,7 @@ import type { RecordingPage, Zone, ZoneInput } from "../types/recording";
 import type { AiStatus, AlertItem, DiscoveryResult, EventItem, Integration, IntegrationInput, Metrics } from "../types/operations";
 import type { LoginResponse, Role, Share, User, UserRecord } from "../types/auth";
 import type { StorageIntegration, StorageIntegrationInput, StorageOverview, StorageProbe, StorageRecording } from "../types/storage";
+import type { MonitoringFilters, MonitoringOverview, MonitoringUserDetail } from "../types/monitoring";
 
 const request = async <T>(path: string, options?: RequestInit): Promise<T> => {
   const headers = new Headers(options?.headers);
@@ -87,6 +88,11 @@ export const operationsApi = {
 };
 
 export const monitoringApi = { metrics: () => request<Metrics>("/api/metrics") };
+
+export const adminMonitoringApi = {
+  overview: (filters: MonitoringFilters) => request<MonitoringOverview>(`/api/admin/monitoring/overview?${queryString(filters)}`),
+  user: (id: number) => request<MonitoringUserDetail>(`/api/admin/monitoring/users/${id}`)
+};
 
 export const integrationApi = {
   list: () => request<Integration[]>("/api/integrations"),

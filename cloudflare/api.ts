@@ -170,6 +170,7 @@ const cameraView = (camera: any) => ({
   username: camera.username ?? null,
   main_stream: redactStreamUrl(camera.main_stream),
   sub_stream: redactStreamUrl(camera.sub_stream),
+  user_id: camera.user_id ?? null,
   enabled: !!camera.enabled,
   recording_enabled: !!camera.recording_enabled,
   ai_enabled: !!camera.ai_enabled,
@@ -293,19 +294,91 @@ const ensureSeeded = (env: Env) => {
   return seedPromise;
 };
 
-const audit = async (request: Request, env: Env, user: any, action: string, target: string) => {
+const requestIp = (request: Request) =>
+  request.headers.get("cf-connecting-ip") || String(request.headers.get("x-forwarded-for") || "").split(",")[0].trim() || "";
+
+const requestUserAgent = (request: Request) => String(request.headers.get("user-agent") || "").slice(0, 500);
+
+const toTime = (value: any) => {
+  const time = Date.parse(String(value ?? ""));
+  return Number.isFinite(time) ? time : 0;
+};
+
+const audit = async (request: Request, env: Env, user: any, action: string, target: string, cameraId?: number | null) => {
   try {
-    const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "";
     await run(
       env.DB,
-      "INSERT INTO audit_logs (user_id,username,action,target,ip,created_at) VALUES (?,?,?,?,?,?)",
+      "INSERT INTO audit_logs (user_id,username,action,target,camera_id,ip,created_at) VALUES (?,?,?,?,?,?,?)",
       user?.id ?? null,
       user?.username ?? null,
       action,
       target,
-      ip,
+      Number.isFinite(Number(cameraId)) ? Number(cameraId) : null,
+      requestIp(request),
       stamp()
     );
+  } catch {
+    return;
+  }
+};
+
+const openSessionHistory = async (request: Request, env: Env, token: string, user: any, expiresAt: string, loginAt = stamp()) => {
+  try {
+    await run(
+      env.DB,
+      `INSERT OR IGNORE INTO user_sessions_history (id,user_id,username,login_at,last_seen_at,expires_at,ip,user_agent,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+      token,
+      user?.id ?? null,
+      user?.username ?? null,
+      loginAt,
+      loginAt,
+      expiresAt,
+      requestIp(request),
+      requestUserAgent(request),
+      stamp()
+    );
+  } catch {
+    return;
+  }
+};
+
+const closeSessionHistory = async (env: Env, token: string, reason: string) => {
+  try {
+    const now = stamp();
+    await run(
+      env.DB,
+      "UPDATE user_sessions_history SET logout_at=?, end_reason=?, last_seen_at=COALESCE(last_seen_at,?) WHERE id=? AND logout_at IS NULL",
+      now,
+      reason,
+      now,
+      token
+    );
+  } catch {
+    return;
+  }
+};
+
+const touchSession = async (request: Request, env: Env, token: string, session: any, user: any) => {
+  const lastSeen = toTime(session.last_seen_at ?? session.created_at);
+  if (Date.now() - lastSeen < 60000) return;
+  const now = stamp();
+  await openSessionHistory(request, env, token, user, session.expires_at, session.created_at || now);
+  try {
+    await run(env.DB, "UPDATE sessions SET last_seen_at=? WHERE id=?", now, token);
+    await run(env.DB, "UPDATE user_sessions_history SET last_seen_at=?, username=COALESCE(username,?) WHERE id=?", now, user?.username ?? null, token);
+  } catch {
+    return;
+  }
+};
+
+const sweepExpiredSessions = async (env: Env) => {
+  try {
+    const expired = await all(env.DB, "SELECT id FROM sessions WHERE expires_at<=?", stamp());
+    for (const session of expired) {
+      await closeSessionHistory(env, String(session.id), "expired");
+      await run(env.DB, "DELETE FROM sessions WHERE id=?", String(session.id));
+    }
   } catch {
     return;
   }
@@ -317,11 +390,13 @@ const currentUser = async (request: Request, env: Env) => {
   const session = await first(env.DB, "SELECT * FROM sessions WHERE id=?", token);
   if (!session) return null;
   if (new Date(session.expires_at).getTime() <= Date.now()) {
+    await closeSessionHistory(env, token, "expired");
     await run(env.DB, "DELETE FROM sessions WHERE id=?", token);
     return null;
   }
   const user = await first(env.DB, "SELECT * FROM users WHERE id=?", session.user_id);
   if (!user || !user.is_active) return null;
+  await touchSession(request, env, token, session, user);
   return user;
 };
 
@@ -334,14 +409,18 @@ const login = async (request: Request, env: Env): Promise<Response> => {
   if (!user.is_active) return fail("Account is disabled", 403);
   const token = randomToken();
   const hours = sessionHours(env);
+  const expiresAt = new Date(Date.now() + hours * 3600000).toISOString();
+  const now = stamp();
   await run(
     env.DB,
-    "INSERT INTO sessions (id,user_id,expires_at,created_at) VALUES (?,?,?,?)",
+    "INSERT INTO sessions (id,user_id,expires_at,last_seen_at,created_at) VALUES (?,?,?,?,?)",
     token,
     user.id,
-    new Date(Date.now() + hours * 3600000).toISOString(),
-    stamp()
+    expiresAt,
+    now,
+    now
   );
+  await openSessionHistory(request, env, token, user, expiresAt, now);
   await audit(request, env, user, "login", "session");
   const maxAge = data.remember_me ? hours * 3600 : undefined;
   return json(
@@ -370,14 +449,18 @@ const guestLogin = async (request: Request, env: Env): Promise<Response> => {
     user = await first(env.DB, "SELECT * FROM users WHERE username=?", "guest");
   }
   const token = randomToken();
+  const expiresAt = new Date(Date.now() + 3600000).toISOString();
+  const now = stamp();
   await run(
     env.DB,
-    "INSERT INTO sessions (id,user_id,expires_at,created_at) VALUES (?,?,?,?)",
+    "INSERT INTO sessions (id,user_id,expires_at,last_seen_at,created_at) VALUES (?,?,?,?,?)",
     token,
     user.id,
-    new Date(Date.now() + 3600000).toISOString(),
-    stamp()
+    expiresAt,
+    now,
+    now
   );
+  await openSessionHistory(request, env, token, user, expiresAt, now);
   await audit(request, env, user, "guest_login", "session");
   return json({ user: userView(user), authenticated: true }, 200, {
     "set-cookie": sessionCookie(request, token, 3600)
@@ -489,7 +572,7 @@ const importCamerasFromApi = async (request: Request, env: Env, user: any): Prom
     const createdAt = stamp();
     statements.push(
       env.DB.prepare(
-        "INSERT INTO cameras (name,location,manufacturer,model,host,port,protocol,rtsp_url,onvif_url,username,password_enc,main_stream,sub_stream,enabled,recording_enabled,ai_enabled,import_endpoint,external_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        "INSERT INTO cameras (name,location,manufacturer,model,host,port,protocol,rtsp_url,onvif_url,username,password_enc,main_stream,sub_stream,enabled,recording_enabled,ai_enabled,import_endpoint,external_id,user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
       ).bind(
         candidate.name,
         String(item.location ?? "").slice(0, 200),
@@ -509,6 +592,7 @@ const importCamerasFromApi = async (request: Request, env: Env, user: any): Prom
         item.ai_enabled === false ? 0 : 1,
         normalizedEndpoint,
         candidate.externalId,
+        user?.id ?? null,
         createdAt,
         createdAt
       )
@@ -745,7 +829,7 @@ const camerasRoute = async (request: Request, env: Env, parts: string[], method:
       const secret = env.ENCRYPTION_KEY || env.SECRET_KEY;
       await run(
         db,
-        "INSERT INTO cameras (name,location,manufacturer,model,host,port,protocol,rtsp_url,onvif_url,username,password_enc,main_stream,sub_stream,enabled,recording_enabled,ai_enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO cameras (name,location,manufacturer,model,host,port,protocol,rtsp_url,onvif_url,username,password_enc,main_stream,sub_stream,enabled,recording_enabled,ai_enabled,user_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         name,
         String(data.location ?? ""),
         String(data.manufacturer ?? "Generic"),
@@ -762,10 +846,12 @@ const camerasRoute = async (request: Request, env: Env, parts: string[], method:
         data.enabled === false ? 0 : 1,
         data.recording_enabled === false ? 0 : 1,
         data.ai_enabled === false ? 0 : 1,
+        user?.id ?? null,
         stamp(),
         stamp()
       );
       const created = await first(db, "SELECT * FROM cameras ORDER BY id DESC LIMIT 1");
+      await audit(request, env, user, "camera.created", String(created?.id ?? ""), created?.id ?? null);
       return json(cameraView(created), 201);
     }
   }
@@ -941,7 +1027,9 @@ const usersRoute = async (request: Request, env: Env, parts: string[], method: s
         data.is_active === false ? 0 : 1,
         stamp()
       );
-      return json(userView(await first(db, "SELECT * FROM users WHERE username=?", username)), 201);
+      const created = await first(db, "SELECT * FROM users WHERE username=?", username);
+      await audit(request, env, actor, "user.created", username);
+      return json(userView(created), 201);
     }
   }
 
@@ -950,6 +1038,8 @@ const usersRoute = async (request: Request, env: Env, parts: string[], method: s
   if (!user) return fail("User not found", 404);
 
   if (parts[3] === "sessions" && parts[4] === "revoke" && method === "POST") {
+    const activeSessions = await all(db, "SELECT id FROM sessions WHERE user_id=?", id);
+    for (const active of activeSessions) await closeSessionHistory(env, String(active.id), "revoked");
     await run(db, "DELETE FROM sessions WHERE user_id=?", id);
     await audit(request, env, actor, "sessions.revoked", String(id));
     return empty();
@@ -970,8 +1060,11 @@ const usersRoute = async (request: Request, env: Env, parts: string[], method: s
     return json(userView(await first(db, "SELECT * FROM users WHERE id=?", id)));
   }
   if (parts.length === 3 && method === "DELETE") {
+    const activeSessions = await all(db, "SELECT id FROM sessions WHERE user_id=?", id);
+    for (const active of activeSessions) await closeSessionHistory(env, String(active.id), "user_deleted");
     await run(db, "DELETE FROM sessions WHERE user_id=?", id);
     await run(db, "DELETE FROM users WHERE id=?", id);
+    await audit(request, env, actor, "user.deleted", String(id));
     return empty();
   }
   return fail("Not found", 404);
@@ -1384,6 +1477,293 @@ const storageOverview = async (env: Env): Promise<Response> => {
   });
 };
 
+const SESSION_ONLINE_WINDOW_MS = 5 * 60 * 1000;
+
+const latestStamp = (values: any[]) => values.filter(Boolean).sort((left, right) => toTime(right) - toTime(left))[0] ?? null;
+
+const earliestStamp = (values: any[]) => values.filter(Boolean).sort((left, right) => toTime(left) - toTime(right))[0] ?? null;
+
+const matchesDate = (value: any, date: string) => !date || String(value ?? "").startsWith(date);
+
+const sessionIsOnline = (session: any) => {
+  const expires = toTime(session.expires_at);
+  const seen = toTime(session.last_seen_at ?? session.created_at);
+  return (!expires || expires > Date.now()) && seen > 0 && seen >= Date.now() - SESSION_ONLINE_WINDOW_MS;
+};
+
+const cameraMonitorState = (camera: any, status: any) => {
+  if (!camera.enabled) return "disabled";
+  const value = String(status?.status ?? "").toLowerCase();
+  if (value === "online" || value === "recording") return "online";
+  if (value === "starting" || value === "reconnecting") return "connecting";
+  return "offline";
+};
+
+const recordingMonitorState = (camera: any, status: any) => {
+  if (!camera.recording_enabled) return "disabled";
+  const value = String(status?.recording ?? "").toLowerCase();
+  if (value === "recording") return "recording";
+  if (value === "error") return "error";
+  if (value === "starting" || value === "reconnecting") return value;
+  return "stopped";
+};
+
+const monitoringFilters = (url: URL) => ({
+  username: String(url.searchParams.get("username") ?? "").trim().toLowerCase(),
+  date: String(url.searchParams.get("date") ?? "").trim(),
+  session_state: String(url.searchParams.get("session_state") ?? "").trim().toLowerCase(),
+  camera_state: String(url.searchParams.get("camera_state") ?? "").trim().toLowerCase(),
+  recording_state: String(url.searchParams.get("recording_state") ?? "").trim().toLowerCase()
+});
+
+const bridgeCameraStatuses = async (env: Env) => {
+  const statuses: Record<string, any> = {};
+  const info = { status: "unavailable", config_loaded_at: null as any, config_error: null as any, error: null as any };
+  if (env.MEDIA_BRIDGE_URL && env.MEDIA_BRIDGE_TOKEN) {
+    try {
+      const upstream = await bridgeFetch(env, "/status");
+      if (upstream.ok) {
+        const payload: any = await upstream.json().catch(() => ({}));
+        for (const item of payload.cameras ?? []) statuses[String(item.camera_id ?? item.id)] = item;
+        info.status = "online";
+        info.config_loaded_at = payload.config_loaded_at ?? null;
+        info.config_error = payload.config_error ?? null;
+        return { statuses, info };
+      }
+      info.error = `Media bridge returned HTTP ${upstream.status}`;
+    } catch (error: any) {
+      info.error = error?.message || "Media bridge is unreachable";
+    }
+  } else {
+    info.error = "Media bridge is not configured";
+  }
+  const cameras = await all(env.DB, "SELECT * FROM cameras WHERE enabled=1 ORDER BY id");
+  const entries = await Promise.all(cameras.map(async (camera: any) => {
+    try {
+      const upstream = await cameraBridgeAction(env, camera, "/status");
+      if (!upstream.ok) return { id: String(camera.id), status: null };
+      return { id: String(camera.id), status: await upstream.json().catch(() => ({})) };
+    } catch {
+      return { id: String(camera.id), status: null };
+    }
+  }));
+  for (const entry of entries) if (entry.status) statuses[entry.id] = entry.status;
+  if (Object.keys(statuses).length) info.status = "online";
+  return { statuses, info };
+};
+
+const monitoringActivityView = (row: any) => ({
+  id: row.id,
+  user_id: row.user_id ?? null,
+  username: row.username ?? null,
+  action: row.action,
+  target: row.target ?? "",
+  camera_id: row.camera_id ?? null,
+  ip: row.ip ?? "",
+  created_at: row.created_at
+});
+
+const monitoringSessionView = (row: any, activeById: Map<string, any>) => {
+  const active = activeById.get(String(row.id)) ?? null;
+  return {
+    id: String(row.id),
+    user_id: Number(row.user_id),
+    username: row.username ?? null,
+    login_at: row.login_at,
+    last_seen_at: latestStamp([row.last_seen_at, active?.last_seen_at]),
+    logout_at: row.logout_at ?? null,
+    end_reason: row.end_reason ?? null,
+    expires_at: row.expires_at ?? null,
+    ip: row.ip ?? "",
+    user_agent: row.user_agent ?? "",
+    active: !!active,
+    online: active ? sessionIsOnline(active) : false
+  };
+};
+
+const monitoringOverview = async (env: Env, url: URL, actor: any): Promise<Response> => {
+  if (actor.role !== "admin") return fail("Administrator access required", 403);
+  await sweepExpiredSessions(env);
+  const filters = monitoringFilters(url);
+  const [userRows, cameraRows, activeSessions, historyRows, auditRows, recordingRows, storageRows] = await Promise.all([
+    all(env.DB, "SELECT * FROM users ORDER BY id"),
+    all(env.DB, "SELECT * FROM cameras ORDER BY id"),
+    all(env.DB, "SELECT * FROM sessions ORDER BY created_at DESC"),
+    all(env.DB, "SELECT * FROM user_sessions_history ORDER BY login_at DESC LIMIT 500"),
+    all(env.DB, "SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 500"),
+    all(env.DB, "SELECT * FROM camera_recordings ORDER BY started_at DESC LIMIT 500"),
+    all(env.DB, "SELECT * FROM storage_servers ORDER BY id")
+  ]);
+  const bridge = await bridgeCameraStatuses(env);
+  const ownerById = new Map(userRows.map((row: any) => [Number(row.id), row]));
+  const activeById = new Map(activeSessions.map((row: any) => [String(row.id), row]));
+  const recordingsByCamera = new Map<number, any[]>();
+  for (const recording of recordingRows) {
+    const key = Number(recording.camera_id);
+    const list = recordingsByCamera.get(key) ?? [];
+    list.push(recording);
+    recordingsByCamera.set(key, list);
+  }
+  for (const list of recordingsByCamera.values()) list.sort((left, right) => toTime(right.started_at) - toTime(left.started_at));
+
+  const cameras = cameraRows.map((camera: any) => {
+    const status = bridge.statuses[String(camera.id)] ?? null;
+    const cameraRecordings = recordingsByCamera.get(Number(camera.id)) ?? [];
+    const owner = ownerById.get(Number(camera.user_id));
+    return {
+      ...cameraView(camera),
+      owner: owner?.username ?? "Unassigned",
+      stream_state: cameraMonitorState(camera, status),
+      recording_state: recordingMonitorState(camera, status),
+      stream_status: status?.status ?? null,
+      recording_status: status?.recording ?? null,
+      last_error: status?.message || status?.recording_error || null,
+      last_recording_at: latestStamp([status?.last_recording_at, cameraRecordings[0]?.started_at]),
+      recording_count: cameraRecordings.length,
+      recorded_bytes: cameraRecordings.reduce((sum: number, item: any) => sum + (Number(item.size_bytes) || 0), 0)
+    };
+  });
+  const cameraStateById = new Map(cameras.map((camera: any) => [Number(camera.id), camera]));
+
+  const users = userRows.map((user: any) => {
+    const owned = cameras.filter((camera: any) => Number(camera.user_id) === Number(user.id));
+    const active = activeSessions.filter((session: any) => Number(session.user_id) === Number(user.id));
+    const history = historyRows.filter((row: any) => Number(row.user_id) === Number(user.id));
+    const activity = auditRows.filter((row: any) => Number(row.user_id) === Number(user.id) || String(row.username ?? "").toLowerCase() === String(user.username ?? "").toLowerCase());
+    return {
+      ...userView(user),
+      first_login_at: earliestStamp(history.map((row: any) => row.login_at)),
+      last_seen_at: latestStamp([...history.map((row: any) => row.last_seen_at), ...active.map((session: any) => session.last_seen_at ?? session.created_at)]),
+      online: active.some(sessionIsOnline),
+      active_sessions: active.filter(sessionIsOnline).length,
+      camera_count: owned.length,
+      online_cameras: owned.filter((camera: any) => camera.stream_state === "online").length,
+      recording_cameras: owned.filter((camera: any) => camera.recording_state === "recording").length,
+      recording_count: owned.reduce((sum: number, camera: any) => sum + camera.recording_count, 0),
+      audit_count: activity.length
+    };
+  });
+
+  const matchesUser = (username: any) => !filters.username || String(username ?? "").toLowerCase().includes(filters.username);
+  const activity = auditRows.map(monitoringActivityView).filter((row: any) => matchesUser(row.username) && matchesDate(row.created_at, filters.date));
+  const sessions = historyRows.map((row: any) => monitoringSessionView(row, activeById)).filter((row: any) => {
+    if (!matchesUser(row.username)) return false;
+    if (!matchesDate(row.login_at, filters.date) && !matchesDate(row.last_seen_at, filters.date)) return false;
+    if (filters.session_state === "online" && !row.online) return false;
+    if (filters.session_state === "active" && !row.active) return false;
+    if (filters.session_state === "offline" && row.online) return false;
+    if (filters.session_state === "closed" && row.active) return false;
+    return true;
+  });
+  const filteredCameras = cameras.filter((camera: any) => {
+    if (!matchesUser(camera.owner)) return false;
+    if (!matchesDate(camera.created_at, filters.date) && !matchesDate(camera.last_recording_at, filters.date)) return false;
+    if (filters.camera_state && camera.stream_state !== filters.camera_state) return false;
+    if (filters.recording_state && camera.recording_state !== filters.recording_state) return false;
+    return true;
+  });
+  const filteredUsers = users.filter((user: any) => {
+    if (!matchesUser(user.username)) return false;
+    if (!matchesDate(user.created_at, filters.date) && !matchesDate(user.first_login_at, filters.date) && !matchesDate(user.last_seen_at, filters.date)) return false;
+    if (filters.session_state === "online" && !user.online) return false;
+    if (filters.session_state === "offline" && user.online) return false;
+    const owned = cameras.filter((camera: any) => Number(camera.user_id) === Number(user.id));
+    if (filters.camera_state && !owned.some((camera: any) => camera.stream_state === filters.camera_state)) return false;
+    if (filters.recording_state && !owned.some((camera: any) => camera.recording_state === filters.recording_state)) return false;
+    return true;
+  });
+  const recordings = recordingRows.map((row: any) => {
+    const camera = cameraStateById.get(Number(row.camera_id));
+    return {
+      ...recordingView(row),
+      owner: camera?.owner ?? "Unassigned",
+      stream_state: camera?.stream_state ?? "offline",
+      recording_state: camera?.recording_state ?? "stopped"
+    };
+  }).filter((row: any) => {
+    if (!matchesUser(row.owner)) return false;
+    if (!matchesDate(row.started_at, filters.date)) return false;
+    if (filters.camera_state && row.stream_state !== filters.camera_state) return false;
+    if (filters.recording_state && row.recording_state !== filters.recording_state) return false;
+    return true;
+  });
+  const today = new Date().toISOString().slice(0, 10);
+  const recordedBytes = recordingRows.reduce((sum: number, row: any) => sum + (Number(row.size_bytes) || 0), 0);
+  const summary = {
+    accounts: userRows.length,
+    online_users: new Set(activeSessions.filter(sessionIsOnline).map((session: any) => Number(session.user_id))).size,
+    active_sessions: activeSessions.filter(sessionIsOnline).length,
+    cameras: cameraRows.length,
+    online_cameras: cameras.filter((camera: any) => camera.stream_state === "online").length,
+    recording_cameras: cameras.filter((camera: any) => camera.recording_state === "recording").length,
+    recordings_total: recordingRows.length,
+    recordings_today: recordingRows.filter((row: any) => matchesDate(row.started_at, today)).length,
+    recorded_bytes: recordedBytes
+  };
+  return json({
+    generated_at: stamp(),
+    filters,
+    summary,
+    bridge: bridge.info,
+    storage: {
+      recorded_bytes: recordedBytes,
+      servers: storageRows.map(storageView)
+    },
+    users,
+    cameras: filteredCameras,
+    sessions,
+    activity,
+    recordings
+  });
+};
+
+const monitoringUserDetail = async (env: Env, id: number): Promise<Response> => {
+  await sweepExpiredSessions(env);
+  const user = await first(env.DB, "SELECT * FROM users WHERE id=?", id);
+  if (!user) return fail("User not found", 404);
+  const [activeSessions, historyRows, auditRows, ownedCameras] = await Promise.all([
+    all(env.DB, "SELECT * FROM sessions WHERE user_id=? ORDER BY created_at DESC", id),
+    all(env.DB, "SELECT * FROM user_sessions_history WHERE user_id=? ORDER BY login_at DESC LIMIT 200", id),
+    all(env.DB, "SELECT * FROM audit_logs WHERE user_id=? OR username=? ORDER BY created_at DESC LIMIT 200", id, user.username),
+    all(env.DB, "SELECT * FROM cameras WHERE user_id=? ORDER BY id", id)
+  ]);
+  const cameraIds = ownedCameras.map((camera: any) => Number(camera.id));
+  const placeholders = cameraIds.length ? cameraIds.map(() => "?").join(",") : "NULL";
+  const [recordings, events] = cameraIds.length
+    ? await Promise.all([
+      all(env.DB, `SELECT * FROM camera_recordings WHERE camera_id IN (${placeholders}) ORDER BY started_at DESC LIMIT 200`, ...cameraIds),
+      all(env.DB, `SELECT * FROM events WHERE camera_id IN (${placeholders}) ORDER BY occurred_at DESC LIMIT 200`, ...cameraIds)
+    ])
+    : [[], []];
+  const activeById = new Map(activeSessions.map((row: any) => [String(row.id), row]));
+  const lastSeen = latestStamp([...historyRows.map((row: any) => row.last_seen_at), ...activeSessions.map((row: any) => row.last_seen_at ?? row.created_at)]);
+  return json({
+    user: userView(user),
+    summary: {
+      first_login_at: latestStamp(historyRows.map((row: any) => row.login_at).reverse()),
+      last_seen_at: lastSeen,
+      active_sessions: activeSessions.filter(sessionIsOnline).length,
+      total_sessions: historyRows.length,
+      cameras: ownedCameras.length,
+      recordings: recordings.length,
+      events: events.length,
+      audit_actions: auditRows.length
+    },
+    sessions: historyRows.map((row: any) => monitoringSessionView(row, activeById)),
+    activity: auditRows.map(monitoringActivityView),
+    cameras: ownedCameras.map(cameraView),
+    recordings: recordings.map(recordingView),
+    events: events.map(eventView)
+  });
+};
+
+const monitoringRoute = async (request: Request, env: Env, parts: string[], method: string, url: URL, actor: any): Promise<Response> => {
+  if (actor.role !== "admin") return fail("Administrator access required", 403);
+  if (method === "GET" && (parts.length === 3 || (parts.length === 4 && parts[3] === "overview"))) return monitoringOverview(env, url, actor);
+  if (method === "GET" && parts.length === 5 && parts[3] === "users") return monitoringUserDetail(env, Number(parts[4]));
+  return fail("Not found", 404);
+};
+
 const probeTotal = (servers: any[]): number => servers.reduce((sum, server) => sum + (server.probe?.usage?.total_bytes ?? 0), 0);
 
 const route = async (request: Request, env: Env): Promise<Response> => {
@@ -1419,6 +1799,7 @@ const route = async (request: Request, env: Env): Promise<Response> => {
     const token = parseCookies(request).localvision_session;
     if (token) {
       await audit(request, env, user, "logout", "session");
+      await closeSessionHistory(env, token, "logout");
       await run(env.DB, "DELETE FROM sessions WHERE id=?", token);
     }
     return empty();
@@ -1431,12 +1812,15 @@ const route = async (request: Request, env: Env): Promise<Response> => {
     const next = String(data.new_password ?? "");
     if (next.length < 8) return fail("New password must be at least 8 characters");
     const token = parseCookies(request).localvision_session;
+    const revoked = await all(env.DB, "SELECT id FROM sessions WHERE user_id=? AND id<>?", user.id, token);
     await run(env.DB, "UPDATE users SET password_hash=? WHERE id=?", await hashPassword(next), user.id);
+    for (const session of revoked) await closeSessionHistory(env, String(session.id), "password_changed");
     await run(env.DB, "DELETE FROM sessions WHERE user_id=? AND id<>?", user.id, token);
     await audit(request, env, user, "password.changed", "account");
     return empty();
   }
 
+  if (parts[1] === "admin" && parts[2] === "monitoring") return monitoringRoute(request, env, parts, method, url, user);
   if (parts[1] === "cameras") return camerasRoute(request, env, parts, method, user);
   if (parts[1] === "users") return usersRoute(request, env, parts, method, user);
   if (parts[1] === "storage") {

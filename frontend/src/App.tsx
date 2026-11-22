@@ -125,7 +125,7 @@ export default function App() {
     : page === "users" ? (user.role === "admin" ? <UsersPage currentUser={user} /> : <PlaceholderPage title="User management restricted" description="Only administrators can manage accounts and permissions." />)
     : page === "integrations" ? <IntegrationsPage canWrite={canWrite} />
     : page === "settings" ? <AccountSettings user={user} canManageUsers={canManageUsers} onLogout={async () => { try { await authApi.logout(); } finally { setUser(null); setPage("dashboard"); setShowSplash(false); } }} />
-    : page === "system" ? <SystemPage />
+    : page === "system" ? (user.role === "admin" ? <SystemPage role={user.role} /> : <PlaceholderPage title="System monitoring restricted" description="Only administrators can view global activity, camera, recording, and storage reports." />)
     : <PlaceholderPage title={labels[page]?.[0] ?? page} description={labels[page]?.[1] ?? "This area is ready for the next implementation phase."} />;
 
     return <div className="app"><Sidebar active={page} role={user.role} onNavigate={setPage} /><main className="main">

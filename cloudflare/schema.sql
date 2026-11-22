@@ -17,9 +17,27 @@ CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL,
   expires_at TEXT NOT NULL,
+  last_seen_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS user_sessions_history (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  username TEXT,
+  login_at TEXT NOT NULL,
+  last_seen_at TEXT,
+  logout_at TEXT,
+  end_reason TEXT,
+  expires_at TEXT,
+  ip TEXT NOT NULL DEFAULT '',
+  user_agent TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_sessions_history_user_id ON user_sessions_history(user_id, login_at DESC);
 
 CREATE TABLE IF NOT EXISTS cameras (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,11 +59,14 @@ CREATE TABLE IF NOT EXISTS cameras (
   ai_enabled INTEGER NOT NULL DEFAULT 1,
   import_endpoint TEXT,
   external_id TEXT,
+  user_id INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cameras_import_route ON cameras(import_endpoint, external_id);
+
+CREATE INDEX IF NOT EXISTS idx_cameras_user_id ON cameras(user_id);
 
 CREATE TABLE IF NOT EXISTS zones (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,6 +176,11 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   username TEXT,
   action TEXT NOT NULL,
   target TEXT NOT NULL DEFAULT '',
+  camera_id INTEGER,
   ip TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_camera_id ON audit_logs(camera_id, created_at DESC);

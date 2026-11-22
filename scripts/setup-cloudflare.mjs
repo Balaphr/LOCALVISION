@@ -42,11 +42,19 @@ if (!columnText.includes("import_endpoint")) {
   run("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--file=cloudflare/migrations/0001_camera_import.sql"]);
 }
 
-const tables = capture("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--command", "SELECT name FROM sqlite_master WHERE type='table' AND name='camera_recordings';"]);
+const tables = capture("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--command", "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('camera_recordings','user_sessions_history');"]);
 const tableText = `${tables.stdout || ""}${tables.stderr || ""}`;
 if (!tableText.includes("camera_recordings")) {
   console.log("Applying camera recordings migration...");
   run("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--file=cloudflare/migrations/0002_camera_recordings.sql"]);
+}
+const sessionColumns = capture("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--command", "PRAGMA table_info(sessions);"]);
+const auditColumns = capture("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--command", "PRAGMA table_info(audit_logs);"]);
+const sessionColumnText = `${sessionColumns.stdout || ""}${sessionColumns.stderr || ""}`;
+const auditColumnText = `${auditColumns.stdout || ""}${auditColumns.stderr || ""}`;
+if (!tableText.includes("user_sessions_history") || !sessionColumnText.includes("last_seen_at") || !columnText.includes("user_id") || !auditColumnText.includes("camera_id")) {
+  console.log("Applying user monitoring migration...");
+  run("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--file=cloudflare/migrations/0003_user_monitoring.sql"]);
 }
 
 const secrets = capture("npx", ["wrangler", "secret", "list", "--json"]);

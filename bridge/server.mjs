@@ -439,6 +439,17 @@ http.createServer((request, response) => {
     return;
   }
 
+  if (pathname === "/status" && request.method === "GET") {
+    sendJson(response, 200, {
+      ok: true,
+      config_loaded_at: configLoadedAt || null,
+      config_error: configError || null,
+      generated_at: new Date().toISOString(),
+      cameras: [...sessions.values()].map(hlsStatus)
+    });
+    return;
+  }
+
   const hlsMatch = pathname.match(/^\/hls\/(\d+)\/(.+)$/);
   if (hlsMatch && request.method === "GET") {
     const session = getSession(Number(hlsMatch[1]));
