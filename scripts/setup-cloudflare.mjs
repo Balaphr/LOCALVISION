@@ -56,6 +56,14 @@ if (!tableText.includes("user_sessions_history") || !sessionColumnText.includes(
   console.log("Applying user monitoring migration...");
   run("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--file=cloudflare/migrations/0003_user_monitoring.sql"]);
 }
+const alertColumns = capture("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--command", "PRAGMA table_info(alerts);"]);
+const aiTables = capture("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--command", "SELECT name FROM sqlite_master WHERE type='table' AND name='ai_settings';"]);
+const alertColumnText = `${alertColumns.stdout || ""}${alertColumns.stderr || ""}`;
+const aiTableText = `${aiTables.stdout || ""}${aiTables.stderr || ""}`;
+if (!alertColumnText.includes("camera_id") || !aiTableText.includes("ai_settings")) {
+  console.log("Applying AI hardening migration...");
+  run("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--file=cloudflare/migrations/0004_ai_hardening.sql"]);
+}
 
 const secrets = capture("npx", ["wrangler", "secret", "list", "--json"]);
 const secretText = `${secrets.stdout || ""}${secrets.stderr || ""}`;

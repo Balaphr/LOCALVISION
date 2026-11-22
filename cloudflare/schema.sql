@@ -164,11 +164,27 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE TABLE IF NOT EXISTS alerts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  camera_id INTEGER,
   kind TEXT NOT NULL DEFAULT 'system',
   message TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'open',
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  severity TEXT NOT NULL DEFAULT 'warning',
+  status TEXT NOT NULL DEFAULT 'new',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS ai_settings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  camera_id INTEGER,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_camera_id ON alerts(camera_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_settings_camera_id ON ai_settings(camera_id, key);
+CREATE INDEX IF NOT EXISTS idx_events_camera_id ON events(camera_id, occurred_at DESC);
 
 CREATE TABLE IF NOT EXISTS audit_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

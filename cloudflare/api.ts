@@ -202,6 +202,47 @@ const shareView = (share: any) => ({
   created_at: share.created_at
 });
 
+const isAdmin = (user: any) => String(user?.role ?? "").toLowerCase() === "admin";
+const isOperator = (user: any) => String(user?.role ?? "").toLowerCase() === "operator";
+const hasPermission = (user: any, key: string, fallback = true) => {
+  const permissions = parseJson(user?.permissions, {});
+  return permissions[key] === undefined ? fallback : !!permissions[key];
+};
+
+const accessibleCameraIds = async (db: any, user: any): Promise<number[]> => {
+  if (isAdmin(user)) return (await all(db, "SELECT id FROM cameras ORDER BY id")).map((row: any) => Number(row.id));
+  if (!hasPermission(user, "cameras.view", true)) return [];
+  const owned = await all(db, "SELECT id FROM cameras WHERE user_id=? ORDER BY id", user.id);
+  const shared = await all(db, "SELECT camera_id FROM shares WHERE lower(username)=lower(?) ORDER BY camera_id", String(user?.username ?? ""));
+  return [...new Set([...owned.map((row: any) => Number(row.id)), ...shared.map((row: any) => Number(row.camera_id))])].sort((left, right) => left - right);
+};
+
+const cameraFor = async (db: any, user: any, cameraId: number, mode: "view" | "manage" | "owner" = "view"): Promise<any> => {
+  const id = Number(cameraId);
+  if (!Number.isFinite(id)) return fail("Camera not found", 404);
+  const camera = await first(db, "SELECT * FROM cameras WHERE id=?", id);
+  if (!camera) return fail("Camera not found", 404);
+  if (isAdmin(user)) return { camera, owner: true, readOnly: false };
+  const owner = Number(camera.user_id) === Number(user.id);
+  if (mode === "owner") return owner ? { camera, owner, readOnly: false } : fail("Only the camera owner can manage sharing", 403);
+  const share = await first(db, "SELECT * FROM shares WHERE camera_id=? AND lower(username)=lower(?) LIMIT 1", id, String(user?.username ?? ""));
+  if (!owner && !share) return fail("Camera not found", 404);
+  if (mode === "manage") {
+    const allowed = owner || (String(share?.permission ?? "") === "operator" && (isOperator(user) || hasPermission(user, "cameras.manage", false)));
+    if (!allowed) return fail("Camera access is read-only", 403);
+  }
+  return { camera, owner, readOnly: false };
+};
+
+const cameraFilterSql = (ids: number[], params: any[], column = "camera_id", includeNull = false) => {
+  if (!ids.length) return includeNull ? ` AND ${column} IS NULL` : " AND 1=0";
+  params.push(...ids);
+  const list = `${column} IN (${ids.map(() => "?").join(",")})`;
+  return includeNull ? ` AND (${list} OR ${column} IS NULL)` : ` AND ${list}`;
+};
+
+const isValidPermission = (value: any) => ["viewer", "operator"].includes(String(value ?? ""));
+
 const integrationView = (item: any) => ({
   id: item.id,
   name: item.name,
@@ -232,6 +273,7 @@ const storageView = (item: any) => ({
 const eventView = (item: any) => ({
   id: item.id,
   camera_id: item.camera_id ?? null,
+  camera_name: item.camera_name ?? null,
   kind: item.kind,
   object_name: item.object_name ?? null,
   confidence: item.confidence ?? null,
@@ -249,10 +291,14 @@ const eventView = (item: any) => ({
 
 const alertView = (item: any) => ({
   id: item.id,
+  camera_id: item.camera_id ?? null,
+  camera_name: item.camera_name ?? null,
   kind: item.kind,
   message: item.message,
+  severity: item.severity ?? "warning",
   status: item.status,
-  created_at: item.created_at
+  created_at: item.created_at,
+  updated_at: item.updated_at ?? item.created_at
 });
 
 const zeroUsage = (source: string) => ({
@@ -705,14 +751,33 @@ const bridgeConfig = async (env: Env): Promise<Response> => {
   const cameras = await all(env.DB, "SELECT * FROM cameras WHERE enabled=1 ORDER BY id");
   const storageRows = await all(env.DB, "SELECT * FROM storage_servers WHERE enabled=1 AND endpoint<>'' ORDER BY id");
   const storage = storageRows.find((row: any) => row.secret_enc) ?? storageRows[0] ?? null;
+  const zones = await all(env.DB, "SELECT * FROM zones WHERE enabled=1 ORDER BY camera_id,id");
+  const settings = await all(env.DB, "SELECT * FROM ai_settings WHERE enabled=1 ORDER BY camera_id,id");
   return json({
     cameras: await Promise.all(cameras.map(async (camera: any) => ({
       id: Number(camera.id),
       name: camera.name,
       source: await cameraSource(env, camera),
       enabled: !!camera.enabled,
-      recording_enabled: !!camera.recording_enabled
+      recording_enabled: !!camera.recording_enabled,
+      ai_enabled: !!camera.ai_enabled
     }))),
+    zones: zones.map((zone: any) => ({
+      id: Number(zone.id),
+      camera_id: Number(zone.camera_id),
+      name: zone.name,
+      zone_type: zone.zone_type,
+      points: parseJson(zone.points, []),
+      object_filters: parseJson(zone.object_filters, []),
+      confidence_threshold: Number(zone.confidence_threshold ?? 0.5),
+      direction: zone.direction ?? null
+    })),
+    ai_settings: settings.map((setting: any) => ({
+      camera_id: setting.camera_id ? Number(setting.camera_id) : null,
+      key: setting.key,
+      value: setting.value,
+      enabled: !!setting.enabled
+    })),
     storage: storage ? {
       id: Number(storage.id),
       endpoint: storageBaseUrl(storage.endpoint),
@@ -807,8 +872,13 @@ const recordingsRoute = async (request: Request, env: Env, parts: string[], meth
     const cameraId = Number(url.searchParams.get("camera_id"));
     const cameraFilter = Number.isFinite(cameraId) && cameraId > 0 ? cameraId : null;
     const date = String(url.searchParams.get("date") ?? "").trim();
+    const visibleIds = await accessibleCameraIds(db, user);
+    if (cameraFilter && !visibleIds.includes(cameraFilter)) return json({ items: [], page, page_size: pageSize });
+    const allowedIds = new Set(visibleIds);
     let sql = "SELECT * FROM camera_recordings WHERE 1=1";
     if (cameraFilter) { sql += " AND camera_id=?"; params.push(cameraFilter); }
+    if (visibleIds.length) { sql += ` AND camera_id IN (${visibleIds.map(() => "?").join(",")})`; params.push(...visibleIds); }
+    else sql += " AND 1=0";
     if (date) { sql += " AND date=?"; params.push(date); }
     sql += " ORDER BY started_at DESC";
     const rows = await all(db, sql, ...params);
@@ -823,7 +893,7 @@ const recordingsRoute = async (request: Request, env: Env, parts: string[], meth
       merged.set(key, existing ? { ...existing, ...view, fileUrl: view.fileUrl || existing.fileUrl, downloadUrl: view.downloadUrl || existing.downloadUrl } : view);
     }
     const items = [...merged.values()]
-      .filter(item => (!cameraFilter || item.camera_id === cameraFilter) && (!date || item.date === date))
+      .filter(item => allowedIds.has(Number(item.camera_id)) && (!cameraFilter || item.camera_id === cameraFilter) && (!date || item.date === date))
       .sort((left, right) => String(right.started_at ?? right.date ?? "").localeCompare(String(left.started_at ?? left.date ?? "")))
       .slice((page - 1) * pageSize, page * pageSize);
     return json({ items, page, page_size: pageSize });
@@ -832,6 +902,8 @@ const recordingsRoute = async (request: Request, env: Env, parts: string[], meth
   if (!Number.isFinite(id)) return fail("Recording not found", 404);
   const row = await first(db, "SELECT * FROM camera_recordings WHERE id=?", id);
   if (!row) return fail("Recording not found", 404);
+  const recordingAccess = await cameraFor(db, user, row.camera_id, method === "DELETE" ? "owner" : "view");
+  if (recordingAccess instanceof Response) return recordingAccess;
   if (parts.length === 3 && method === "DELETE") {
     await run(db, "DELETE FROM camera_recordings WHERE id=?", id);
     await audit(request, env, user, "recording.deleted", String(id));
@@ -853,8 +925,13 @@ const camerasRoute = async (request: Request, env: Env, parts: string[], method:
   const sub = parts[3];
 
   if (parts.length === 2) {
-    if (method === "GET") return json((await all(db, "SELECT * FROM cameras ORDER BY id")).map(cameraView));
+    if (method === "GET") {
+      const ids = await accessibleCameraIds(db, user);
+      if (!ids.length) return json([]);
+      return json((await all(db, `SELECT * FROM cameras WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY id`, ...ids)).map(cameraView));
+    }
     if (method === "POST") {
+      if (!isAdmin(user) && !isOperator(user)) return fail("Administrator or operator access required", 403);
       const data = await normalizeCameraInput(env, await bodyOf(request));
       const host = String(data.host ?? "").trim();
       if (!host) return fail("RTSP IP / host is required");
@@ -889,17 +966,31 @@ const camerasRoute = async (request: Request, env: Env, parts: string[], method:
     }
   }
 
-  if (parts[2] === "discover" && method === "POST") return json([]);
-  if (parts[2] === "import" && method === "POST") return importCamerasFromApi(request, env, user);
+  if (parts[2] === "discover" && method === "POST") {
+    if (!isAdmin(user) && !isOperator(user)) return fail("Administrator or operator access required", 403);
+    return json([]);
+  }
+  if (parts[2] === "import" && method === "POST") {
+    if (!isAdmin(user) && !isOperator(user)) return fail("Administrator or operator access required", 403);
+    return importCamerasFromApi(request, env, user);
+  }
   if (parts[2] === "test" && method === "POST") {
+    if (!isAdmin(user) && !isOperator(user)) return fail("Administrator or operator access required", 403);
     return json({ status: "unreachable", message: "Live camera probing is not available in the Cloudflare-only deployment." });
   }
   if (parts[2] === "onvif" && parts[3] === "inspect" && method === "POST") {
+    if (!isAdmin(user) && !isOperator(user)) return fail("Administrator or operator access required", 403);
     return fail("ONVIF inspection requires a local network service and is unavailable in the Cloudflare-only deployment.", 501);
   }
   if (!Number.isFinite(id)) return fail("Camera not found", 404);
-  const camera = await first(db, "SELECT * FROM cameras WHERE id=?", id);
-  if (!camera) return fail("Camera not found", 404);
+  const accessMode: "view" | "manage" | "owner" = sub === "shares" || (parts.length === 3 && method === "DELETE")
+    ? "owner"
+    : method === "GET" || sub === "snapshot" || sub === "preview.jpg" || sub === "stream.mjpeg" || sub === "live" || sub === "stream.m3u8" || sub === "hls"
+      ? "view"
+      : "manage";
+  const access = await cameraFor(db, user, id, accessMode);
+  if (access instanceof Response) return access;
+  const camera = access.camera;
 
   if (parts.length === 3) {
     if (method === "GET") return json(cameraView(camera));
@@ -1012,22 +1103,43 @@ const camerasRoute = async (request: Request, env: Env, parts: string[], method:
     }
     if (method === "POST") {
       const data = await bodyOf(request);
+      const username = String(data.username ?? "").trim();
       const permission = String(data.permission ?? "viewer");
+      if (!username) return fail("Username is required", 422);
+      if (!isValidPermission(permission)) return fail("Permission must be viewer or operator", 422);
+      const target = await first(db, "SELECT * FROM users WHERE username=?", username);
+      if (!target) return fail("No active user was found with that username", 404);
+      if (!target.is_active) return fail("That user account is disabled", 403);
+      if (Number(target.id) === Number(user.id)) return fail("You already own this camera", 422);
+      const duplicate = await first(db, "SELECT id FROM shares WHERE camera_id=? AND lower(username)=lower(?)", id, username);
+      if (duplicate) return fail("This user already has access to the camera", 409);
       await run(
         db,
         "INSERT INTO shares (camera_id,username,role,permission,created_at) VALUES (?,?,?,?,?)",
         id,
-        String(data.username ?? ""),
-        permission,
+        target.username,
+        target.role,
         permission,
         stamp()
       );
       const created = await first(db, "SELECT * FROM shares ORDER BY id DESC LIMIT 1");
+      await audit(request, env, user, "sharing.created", String(id), id);
       return json(shareView(created), 201);
     }
     const shareId = Number(parts[4]);
+    const share = Number.isFinite(shareId) ? await first(db, "SELECT * FROM shares WHERE id=? AND camera_id=?", shareId, id) : null;
+    if (!share) return fail("Share not found", 404);
+    if (parts.length === 5 && method === "PATCH") {
+      const data = await bodyOf(request);
+      const permission = String(data.permission ?? share.permission);
+      if (!isValidPermission(permission)) return fail("Permission must be viewer or operator", 422);
+      await run(db, "UPDATE shares SET permission=? WHERE id=?", permission, shareId);
+      await audit(request, env, user, "sharing.updated", String(id), id);
+      return json(shareView(await first(db, "SELECT * FROM shares WHERE id=?", shareId)));
+    }
     if (parts.length === 5 && method === "DELETE") {
       await run(db, "DELETE FROM shares WHERE id=? AND camera_id=?", shareId, id);
+      await audit(request, env, user, "sharing.revoked", String(id), id);
       return empty();
     }
   }
@@ -1898,6 +2010,411 @@ const monitoringRoute = async (request: Request, env: Env, parts: string[], meth
   return fail("Not found", 404);
 };
 
+const escapeLike = (value: string) => value.replace(/[\\%_]/g, (character) => `\\${character}`);
+
+const aiDefaults = {
+  detection_confidence: 0.55,
+  motion_threshold: 12,
+  frame_interval_ms: 5000,
+  max_objects: 5,
+  surveillance_enabled: true,
+  alert_severity: "warning",
+  notify_webhooks: true,
+  voice_enabled: true,
+  person_only: false
+};
+
+const parseSettingValue = (raw: any): any => {
+  try { return JSON.parse(String(raw)); } catch { return String(raw); }
+};
+
+const aiSettingsFor = async (db: any, cameraId?: number | null): Promise<Record<string, any>> => {
+  const rows = await all(db, "SELECT * FROM ai_settings WHERE enabled=1 AND (camera_id IS NULL OR camera_id=?) ORDER BY camera_id, id", cameraId ?? -1);
+  const settings: Record<string, any> = { ...aiDefaults };
+  for (const row of rows) settings[row.key] = parseSettingValue(row.value);
+  return settings;
+};
+
+const upsertAiSettings = async (db: any, settings: Record<string, any>, cameraId: number | null) => {
+  const keys = Object.keys(aiDefaults).filter((key) => key in settings);
+  for (const key of keys) {
+    const value = JSON.stringify(settings[key]);
+    const existing = await first(db, "SELECT id FROM ai_settings WHERE key=? AND camera_id IS ?", key, cameraId);
+    if (existing) await run(db, "UPDATE ai_settings SET value=?,enabled=1,updated_at=? WHERE id=?", value, stamp(), existing.id);
+    else await run(db, "INSERT INTO ai_settings (camera_id,key,value,enabled,updated_at) VALUES (?,?,?,?,?)", cameraId, key, value, 1, stamp());
+  }
+};
+
+const aiSettingsRoute = async (request: Request, env: Env, url: URL, method: string, user: any): Promise<Response> => {
+  const cameraIdRaw = url.searchParams.get("camera_id");
+  const cameraId = cameraIdRaw ? Number(cameraIdRaw) : null;
+  if (cameraId !== null) {
+    const access = await cameraFor(env.DB, user, cameraId, method === "GET" ? "view" : "manage");
+    if (access instanceof Response) return access;
+  }
+  if (method === "GET") {
+    const rows = await all(env.DB, "SELECT * FROM ai_settings WHERE camera_id IS NULL OR camera_id=? ORDER BY camera_id,id", cameraId ?? -1);
+    return json({
+      settings: await aiSettingsFor(env.DB, cameraId),
+      rows: rows.map((row: any) => ({ id: Number(row.id), camera_id: row.camera_id ? Number(row.camera_id) : null, key: row.key, value: parseSettingValue(row.value), enabled: !!row.enabled, updated_at: row.updated_at }))
+    });
+  }
+  if (method === "POST" || method === "PUT") {
+    if (cameraId === null && !isAdmin(user)) return fail("Administrator access is required for global AI settings", 403);
+    const data = await bodyOf(request);
+    const settings = data.settings ?? data;
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) return fail("AI settings must be an object", 422);
+    const allowed: Record<string, any> = {};
+    for (const key of Object.keys(aiDefaults)) if (key in settings) allowed[key] = settings[key];
+    await upsertAiSettings(env.DB, allowed, cameraId);
+    await audit(request, env, user, "ai.settings_updated", cameraId ? String(cameraId) : "global", cameraId ?? null);
+    return json({ settings: await aiSettingsFor(env.DB, cameraId) });
+  }
+  return fail("Not found", 404);
+};
+
+const notifyIntegrations = async (env: Env, alert: any) => {
+  const integrations = await all(env.DB, "SELECT * FROM integrations WHERE enabled=1 AND endpoint<>'' ORDER BY id");
+  for (const item of integrations) {
+    try {
+      const secret = await decryptSecret(item.secret_enc, env.ENCRYPTION_KEY || env.SECRET_KEY);
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (item.auth_method === "bearer" && secret) headers.Authorization = `Bearer ${secret}`;
+      else if (item.auth_method === "basic" && secret) headers.Authorization = `Basic ${secret}`;
+      else if (item.auth_method === "api_key" && secret) headers["X-API-Key"] = secret;
+      else if (secret) headers["X-API-Key"] = secret;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        await fetch(String(item.endpoint), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ type: "alert", event: "alert", alert }),
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch {}
+  }
+};
+
+const bridgeEventIngest = async (request: Request, env: Env): Promise<Response> => {
+  const data = await bodyOf(request);
+  const cameraId = Number(data.camera_id);
+  if (!Number.isFinite(cameraId) || cameraId <= 0) return fail("camera_id is required", 422);
+  const camera = await first(env.DB, "SELECT * FROM cameras WHERE id=?", cameraId);
+  if (!camera || !camera.enabled) return fail("Camera not found or disabled", 404);
+  const settings = await aiSettingsFor(env.DB, cameraId);
+  const occurredAt = String(data.occurred_at ?? stamp());
+  const objectName = String(data.object_name ?? data.kind ?? "object");
+  const confidence = Math.min(1, Math.max(0, Number(data.confidence ?? 0)));
+  const snapshotPath = String(data.snapshot_path ?? "").trim();
+  const duplicate = await first(
+    env.DB,
+    "SELECT id FROM events WHERE camera_id=? AND occurred_at=? AND object_name=? AND snapshot_path=? LIMIT 1",
+    cameraId,
+    occurredAt,
+    objectName,
+    snapshotPath
+  );
+  if (duplicate) return json({ event_id: Number(duplicate.id), duplicate: true });
+  const snapshotUrl = snapshotPath
+    ? `/api/ai/snapshot?camera_id=${cameraId}&path=${encodeURIComponent(snapshotPath)}`
+    : null;
+  const description = String(data.description ?? `${objectName} detected with ${Math.round(confidence * 100)}% confidence`);
+  await run(
+    env.DB,
+    "INSERT INTO events (camera_id,kind,object_name,confidence,occurred_at,snapshot_path,snapshot_url,clip_path,clip_url,description,track_id,bounding_box,duration_seconds) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    cameraId,
+    String(data.kind ?? "detection"),
+    objectName,
+    confidence,
+    occurredAt,
+    snapshotPath || null,
+    snapshotUrl,
+    data.clip_path ? String(data.clip_path) : null,
+    data.clip_url ? String(data.clip_url) : null,
+    description,
+    data.track_id ? String(data.track_id) : null,
+    data.bounding_box ? JSON.stringify(data.bounding_box) : null,
+    data.duration_seconds === undefined || data.duration_seconds === null ? null : Number(data.duration_seconds)
+  );
+  const saved = await first(env.DB, "SELECT * FROM events ORDER BY id DESC LIMIT 1");
+  let alertId: number | null = null;
+  const severity = String(data.severity ?? settings.alert_severity ?? "warning");
+  if (data.alert !== false && severity !== "none") {
+    await run(
+      env.DB,
+      "INSERT INTO alerts (camera_id,kind,message,severity,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+      cameraId,
+      String(data.kind ?? "detection"),
+      description,
+      severity,
+      "new",
+      stamp(),
+      stamp()
+    );
+    const savedAlert = await first(env.DB, "SELECT * FROM alerts ORDER BY id DESC LIMIT 1");
+    alertId = savedAlert ? Number(savedAlert.id) : null;
+    if (savedAlert && settings.notify_webhooks !== false) {
+      await notifyIntegrations(env, alertView({ ...savedAlert, camera_name: camera.name }));
+    }
+  }
+  return json({ event_id: Number(saved?.id ?? 0), alert_id: alertId, snapshot_url: snapshotUrl }, 201);
+};
+
+const aiSnapshotRoute = async (request: Request, env: Env, url: URL, user: any): Promise<Response> => {
+  const cameraId = Number(url.searchParams.get("camera_id"));
+  const access = await cameraFor(env.DB, user, cameraId, "view");
+  if (access instanceof Response) return access;
+  const path = String(url.searchParams.get("path") ?? "").trim();
+  if (!path || path.includes("..") || /^[a-z]+:\/\//i.test(path) || !/^[A-Za-z0-9_./-]+$/.test(path)) return fail("Invalid snapshot path", 422);
+  const server = await first(env.DB, "SELECT * FROM storage_servers WHERE enabled=1 AND endpoint<>'' ORDER BY id LIMIT 1");
+  if (!server) return fail("No storage server is configured", 404);
+  try {
+    const target = `api/storage/ai/snapshot?path=${encodeURIComponent(path)}`;
+    const upstream = await storageFetch(env, server, target, { headers: { Accept: "image/jpeg" } });
+    if (!upstream.ok) {
+      const detail = await upstream.text().catch(() => "");
+      return fail(`Storage API returned HTTP ${upstream.status}: ${detail.slice(0, 300)}`, 502);
+    }
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: {
+        "content-type": upstream.headers.get("content-type") || "image/jpeg",
+        "cache-control": "private, max-age=60"
+      }
+    });
+  } catch (error: any) {
+    return fail(error?.message || "Could not load snapshot", 502);
+  }
+};
+
+const aiStatusPayload = async (env: Env, user: any) => {
+  const ids = await accessibleCameraIds(env.DB, user);
+  const filter = cameraFilterSql(ids, [], "camera_id", isAdmin(user));
+  const [events, alerts, cameras] = await Promise.all([
+    all(env.DB, `SELECT * FROM events WHERE 1=1${filter} ORDER BY occurred_at DESC LIMIT 200`, ...([] as any[]).concat(ids)),
+    all(env.DB, `SELECT * FROM alerts WHERE 1=1${filter} ORDER BY created_at DESC LIMIT 200`, ...([] as any[]).concat(ids)),
+    all(env.DB, `SELECT * FROM cameras WHERE 1=1${cameraFilterSql(ids, [], "id")} ORDER BY id`, ...([] as any[]).concat(ids))
+  ]);
+  let bridge: any = {};
+  let error: string | null = null;
+  try {
+    const response = await bridgeFetch(env, "/ai/status");
+    if (!response.ok) throw new Error(`Local AI bridge returned HTTP ${response.status}`);
+    bridge = await response.json().catch(() => ({}));
+  } catch (caught: any) {
+    error = caught?.message || "Local AI bridge is unreachable";
+  }
+  return {
+    active: bridge.running ? "hybrid-detector" : "none",
+    provider: bridge.detector?.provider || "local_hybrid",
+    model: bridge.detector?.active || bridge.detector?.model || "local-detector",
+    status: bridge.running ? "running" : "stopped",
+    local_only: true,
+    error: error ?? bridge.error ?? null,
+    detector: bridge.detector ?? null,
+    models: bridge.models ?? [],
+    cameras: bridge.cameras ?? {},
+    fps: bridge.fps ?? null,
+    last_frame_at: bridge.last_frame_at ?? null,
+    counts: {
+      cameras: cameras.length,
+      events: events.length,
+      alerts: alerts.length,
+      new_alerts: alerts.filter((alert: any) => String(alert.status) === "new").length
+    },
+    recent_events: events.slice(0, 10).map(eventView),
+    recent_alerts: alerts.slice(0, 10).map(alertView)
+  };
+};
+
+const aiModelsRoute = async (env: Env): Promise<Response> => {
+  try {
+    const response = await bridgeFetch(env, "/ai/models");
+    if (!response.ok) throw new Error(`Local AI bridge returned HTTP ${response.status}`);
+    const payload: any = await response.json().catch(() => ({}));
+    return json({ models: Array.isArray(payload.models) ? payload.models : [] });
+  } catch (error: any) {
+    return json({ models: [], error: error?.message || "Local AI bridge is unreachable" }, 502);
+  }
+};
+
+const aiAskRoute = async (request: Request, env: Env, user: any): Promise<Response> => {
+  const data = await bodyOf(request);
+  const question = String(data.question ?? data.message ?? "").trim();
+  if (!question) return fail("Question is required", 422);
+  const ids = await accessibleCameraIds(env.DB, user);
+  const eventParams: any[] = [];
+  const alertParams: any[] = [];
+  const eventFilter = cameraFilterSql(ids, eventParams, "e.camera_id", isAdmin(user));
+  const alertFilter = cameraFilterSql(ids, alertParams, "a.camera_id", isAdmin(user));
+  const [events, alerts] = await Promise.all([
+    all(env.DB, `SELECT e.*, c.name AS camera_name FROM events e LEFT JOIN cameras c ON c.id=e.camera_id WHERE 1=1${eventFilter} ORDER BY e.occurred_at DESC LIMIT 12`, ...eventParams),
+    all(env.DB, `SELECT a.*, c.name AS camera_name FROM alerts a LEFT JOIN cameras c ON c.id=a.camera_id WHERE 1=1${alertFilter} ORDER BY a.created_at DESC LIMIT 12`, ...alertParams)
+  ]);
+  const context = [
+    ...events.map((event: any) => `EVENT ${event.occurred_at} ${event.camera_name ?? `camera ${event.camera_id}`}: ${event.description ?? `${event.object_name} ${event.confidence ?? ""}`}`),
+    ...alerts.map((alert: any) => `ALERT ${alert.created_at} ${alert.camera_name ?? `camera ${alert.camera_id}`} [${alert.severity}/${alert.status}]: ${alert.message}`)
+  ];
+  try {
+    const response = await bridgeFetch(env, "/ai/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: question, context, history: Array.isArray(data.history) ? data.history : [] })
+    });
+    const payload: any = await response.json().catch(() => ({}));
+    if (!response.ok) return fail(payload.error || payload.detail || `Local AI bridge returned HTTP ${response.status}`, 502);
+    return json({ answer: String(payload.answer ?? payload.message ?? ""), model: payload.model ?? null });
+  } catch (error: any) {
+    return fail(error?.message || "Local AI assistant is unreachable", 502);
+  }
+};
+
+const surveillanceRoute = async (request: Request, env: Env, parts: string[], method: string, user: any): Promise<Response> => {
+  if (method === "GET" && (parts.length === 2 || (parts.length === 3 && parts[2] === "status"))) {
+    return json(await aiStatusPayload(env, user));
+  }
+  if (method === "POST" && parts.length === 3 && ["start", "stop"].includes(parts[2])) {
+    const data = await bodyOf(request);
+    const cameraId = data.camera_id ? Number(data.camera_id) : null;
+    if (cameraId !== null) {
+      const access = await cameraFor(env.DB, user, cameraId, "manage");
+      if (access instanceof Response) return access;
+    } else if (!isAdmin(user) && !isOperator(user)) {
+      return fail("Administrator or operator access required", 403);
+    }
+    await upsertAiSettings(env.DB, { surveillance_enabled: parts[2] === "start" }, cameraId);
+    await audit(request, env, user, `surveillance.${parts[2]}`, cameraId ? String(cameraId) : "all", cameraId ?? null);
+    try {
+      const response = await bridgeFetch(env, `/ai/${parts[2]}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ camera_id: cameraId })
+      });
+      const payload: any = await response.json().catch(() => ({}));
+      if (!response.ok) return fail(payload.error || payload.detail || `Local AI bridge returned HTTP ${response.status}`, 502);
+      return json(payload);
+    } catch (error: any) {
+      return fail(error?.message || "Local AI bridge is unreachable", 502);
+    }
+  }
+  return fail("Not found", 404);
+};
+
+const eventsRoute = async (env: Env, url: URL, user: any, detectionsOnly = false) => {
+  const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));
+  const pageSize = Math.max(1, Number(url.searchParams.get("page_size") ?? 25));
+  const ids = await accessibleCameraIds(env.DB, user);
+  const params: any[] = [];
+  let sql = "SELECT e.*, c.name AS camera_name FROM events e LEFT JOIN cameras c ON c.id=e.camera_id WHERE 1=1";
+  sql += cameraFilterSql(ids, params, "e.camera_id", isAdmin(user));
+  if (detectionsOnly) sql += " AND e.kind='detection'";
+  const cameraId = url.searchParams.get("camera_id");
+  if (cameraId) {
+    const requested = Number(cameraId);
+    if (!ids.includes(requested)) return { items: [], page, page_size: pageSize };
+    sql += " AND e.camera_id=?";
+    params.push(requested);
+  }
+  const kind = String(url.searchParams.get("kind") ?? "").trim();
+  if (kind) { sql += " AND e.kind=?"; params.push(kind); }
+  const objectName = String(url.searchParams.get("object_name") ?? "").trim();
+  if (objectName) { sql += " AND e.object_name LIKE ? ESCAPE '\\'"; params.push(`%${escapeLike(objectName)}%`); }
+  const search = String(url.searchParams.get("search") ?? "").trim();
+  if (search) { sql += " AND (e.description LIKE ? ESCAPE '\\' OR e.object_name LIKE ? ESCAPE '\\' OR c.name LIKE ? ESCAPE '\\')"; const term = `%${escapeLike(search)}%`; params.push(term, term, term); }
+  const start = String(url.searchParams.get("start") ?? "").trim();
+  if (start) { sql += " AND e.occurred_at>=?"; params.push(start); }
+  const end = String(url.searchParams.get("end") ?? "").trim();
+  if (end) { sql += " AND e.occurred_at<=?"; params.push(end); }
+  const minConfidence = Number(url.searchParams.get("min_confidence"));
+  if (Number.isFinite(minConfidence) && minConfidence > 0) { sql += " AND e.confidence>=?"; params.push(minConfidence); }
+  sql += " ORDER BY e.occurred_at DESC LIMIT ? OFFSET ?";
+  params.push(pageSize, (page - 1) * pageSize);
+  const items = (await all(env.DB, sql, ...params)).map(eventView);
+  return { items, page, page_size: pageSize };
+};
+
+const alertsRoute = async (request: Request, env: Env, parts: string[], method: string, url: URL, user: any): Promise<Response> => {
+  const ids = await accessibleCameraIds(env.DB, user);
+  if (parts.length === 2 && method === "GET") {
+    const params: any[] = [];
+    let sql = "SELECT a.*, c.name AS camera_name FROM alerts a LEFT JOIN cameras c ON c.id=a.camera_id WHERE 1=1";
+    sql += cameraFilterSql(ids, params, "a.camera_id", isAdmin(user));
+    const status = String(url.searchParams.get("status") ?? "").trim().toLowerCase();
+    if (["new", "acknowledged", "resolved"].includes(status)) { sql += " AND a.status=?"; params.push(status); }
+    const severity = String(url.searchParams.get("severity") ?? "").trim().toLowerCase();
+    if (["info", "warning", "critical"].includes(severity)) { sql += " AND a.severity=?"; params.push(severity); }
+    sql += " ORDER BY a.created_at DESC LIMIT 500";
+    return json((await all(env.DB, sql, ...params)).map(alertView));
+  }
+  const id = Number(parts[2]);
+  if (!Number.isFinite(id)) return fail("Alert not found", 404);
+  const alert = await first(env.DB, "SELECT * FROM alerts WHERE id=?", id);
+  if (!alert) return fail("Alert not found", 404);
+  if (alert.camera_id) {
+    const access = await cameraFor(env.DB, user, alert.camera_id, "manage");
+    if (access instanceof Response) return access;
+  } else if (!isAdmin(user)) {
+    return fail("Camera access is read-only", 403);
+  }
+  if ((method === "PATCH" || method === "PUT") && parts.length === 3) {
+    const data = await bodyOf(request);
+    const status = String(data.status ?? (method === "PATCH" ? "acknowledged" : "")).trim().toLowerCase();
+    if (!["new", "acknowledged", "resolved"].includes(status)) return fail("Status must be new, acknowledged, or resolved", 422);
+    await run(env.DB, "UPDATE alerts SET status=?,updated_at=? WHERE id=?", status, stamp(), id);
+    await audit(request, env, user, `alert.${status}`, String(id), alert.camera_id ?? null);
+    return json(alertView(await first(env.DB, "SELECT * FROM alerts WHERE id=?", id)));
+  }
+  return fail("Not found", 404);
+};
+
+const sharingHistoryRoute = async (env: Env, user: any): Promise<Response> => {
+  const rows = await all(env.DB, "SELECT * FROM audit_logs WHERE action LIKE 'sharing.%' ORDER BY created_at DESC LIMIT 200");
+  const ids = new Set(await accessibleCameraIds(env.DB, user));
+  const visible = rows.filter((row: any) => isAdmin(user) || ids.has(Number(row.camera_id)) || String(row.username ?? "").toLowerCase() === String(user.username ?? "").toLowerCase());
+  return json(visible.map(monitoringActivityView));
+};
+
+const testIntegration = async (request: Request, env: Env, parts: string[], user: any): Promise<Response> => {
+  const data = await bodyOf(request);
+  let endpoint = String(data.endpoint ?? "").trim();
+  let secret = String(data.secret ?? "");
+  let authMethod = String(data.auth_method ?? "none");
+  if (!endpoint) {
+    const id = Number(parts[2]);
+    const integration = Number.isFinite(id) ? await first(env.DB, "SELECT * FROM integrations WHERE id=?", id) : null;
+    if (!integration) return fail("Integration not found", 404);
+    endpoint = String(integration.endpoint ?? "").trim();
+    authMethod = String(integration.auth_method ?? "none");
+    secret = await decryptSecret(integration.secret_enc, env.ENCRYPTION_KEY || env.SECRET_KEY);
+  }
+  if (!/^https?:\/\/\S+$/i.test(endpoint)) return fail("Enter a valid http or https endpoint", 422);
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (authMethod === "bearer" && secret) headers.Authorization = `Bearer ${secret}`;
+  else if (authMethod === "basic" && secret) headers.Authorization = `Basic ${secret}`;
+  else if (authMethod === "api_key" && secret) headers["X-API-Key"] = secret;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ type: "test", event: "test", message: "LocalVision integration test" }),
+      signal: controller.signal
+    });
+    const text = await response.text();
+    await audit(request, env, user, "integration.tested", endpoint.slice(0, 200));
+    return json({ ok: response.ok, status: response.status, response: text.slice(0, 500) }, response.ok ? 200 : 502);
+  } catch (error: any) {
+    return fail(error?.message || "Integration endpoint is unreachable", 502);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
 const probeTotal = (servers: any[]): number => servers.reduce((sum, server) => sum + (server.probe?.usage?.total_bytes ?? 0), 0);
 
 const route = async (request: Request, env: Env): Promise<Response> => {
@@ -1919,6 +2436,7 @@ const route = async (request: Request, env: Env): Promise<Response> => {
     if (!env.MEDIA_BRIDGE_TOKEN || request.headers.get("x-bridge-token") !== env.MEDIA_BRIDGE_TOKEN) return fail("Invalid bridge token", 401);
     if (path === "/api/bridge/config" && method === "GET") return bridgeConfig(env);
     if (path === "/api/bridge/recordings" && method === "POST") return bridgeRecordingUpsert(request, env);
+    if (path === "/api/bridge/events" && method === "POST") return bridgeEventIngest(request, env);
     return fail("Not found", 404);
   }
   if (path === "/api/auth/login" && method === "POST") return login(request, env);
@@ -1984,7 +2502,7 @@ const route = async (request: Request, env: Env): Promise<Response> => {
     }
     const id = Number(parts[2]);
     if (parts[3] === "test" && method === "POST") {
-      return json({ ok: false, error: "Outbound integration tests are unavailable in the Cloudflare-only deployment." });
+      return testIntegration(request, env, parts, user);
     }
     if (parts.length === 3 && method === "DELETE") {
       await run(env.DB, "DELETE FROM integrations WHERE id=?", id);
@@ -1995,34 +2513,21 @@ const route = async (request: Request, env: Env): Promise<Response> => {
   if (parts[1] === "recordings") return recordingsRoute(request, env, parts, method, url, user);
 
   if (path === "/api/events" || path === "/api/detections") {
-    const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));
-    const pageSize = Math.max(1, Number(url.searchParams.get("page_size") ?? 25));
-    let sql = "SELECT * FROM events WHERE 1=1";
-    const params: any[] = [];
-    const cameraId = url.searchParams.get("camera_id");
-    if (cameraId) {
-      sql += " AND camera_id=?";
-      params.push(Number(cameraId));
-    }
-    if (path === "/api/detections") {
-      sql += " AND kind='detection'";
-    }
-    sql += " ORDER BY occurred_at DESC LIMIT ? OFFSET ?";
-    params.push(pageSize, (page - 1) * pageSize);
-    return json({ items: (await all(env.DB, sql, ...params)).map(eventView), page, page_size: pageSize });
+    return json(await eventsRoute(env, url, user, path === "/api/detections"));
   }
 
-  if (path === "/api/alerts" && method === "GET") {
-    return json((await all(env.DB, "SELECT * FROM alerts ORDER BY created_at DESC")).map(alertView));
-  }
-  if (parts[1] === "alerts" && parts.length === 3 && method === "PATCH") {
-    await run(env.DB, "UPDATE alerts SET status='acknowledged' WHERE id=?", Number(parts[2]));
-    const alert = await first(env.DB, "SELECT * FROM alerts WHERE id=?", Number(parts[2]));
-    return alert ? json(alertView(alert)) : fail("Alert not found", 404);
-  }
+  if (parts[1] === "alerts") return alertsRoute(request, env, parts, method, url, user);
+  if (path === "/api/sharing/history" && method === "GET") return sharingHistoryRoute(env, user);
   if (path === "/api/audit-logs" && method === "GET") {
+    if (!isAdmin(user)) return fail("Administrator access required", 403);
     return json(await all(env.DB, "SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200"));
   }
+  if (path === "/api/ai/settings" && ["GET", "POST", "PUT"].includes(method)) return aiSettingsRoute(request, env, url, method, user);
+  if (path === "/api/ai/snapshot" && method === "GET") return aiSnapshotRoute(request, env, url, user);
+  if (path === "/api/ai/status" && method === "GET") return json(await aiStatusPayload(env, user));
+  if (path === "/api/ai/models" && method === "GET") return aiModelsRoute(env);
+  if (path === "/api/ai/ask" && method === "POST") return aiAskRoute(request, env, user);
+  if (parts[1] === "surveillance") return surveillanceRoute(request, env, parts, method, user);
 
   if (path === "/api/settings" && method === "GET") {
     return json({
@@ -2033,39 +2538,20 @@ const route = async (request: Request, env: Env): Promise<Response> => {
     });
   }
   if (path === "/api/metrics" && method === "GET") {
-    const [bridge, storageRows] = await Promise.all([
+    const [bridge, storageRows, ai] = await Promise.all([
       bridgeCameraStatuses(env),
-      all(env.DB, "SELECT * FROM storage_servers WHERE enabled=1 ORDER BY id")
+      all(env.DB, "SELECT * FROM storage_servers WHERE enabled=1 ORDER BY id"),
+      aiStatusPayload(env, user)
     ]);
     const storageProbes = await Promise.all(storageRows.map(async (row: any) => ({ row, probe: await probeStorage(env, row) })));
-    return json(systemHealthFrom(bridge, storageProbes));
+    const metrics = systemHealthFrom(bridge, storageProbes);
+    metrics.ai = ai.status === "running" ? "ok" : "unavailable";
+    metrics.details.ai = ai.error || (ai.status === "running" ? `Local detector running · ${ai.counts.events} event(s)` : "Local detector is not running");
+    return json(metrics);
   }
-  if (path === "/api/ai" && method === "GET") {
-    return json({
-      active: "none",
-      provider: "cloudflare",
-      model: "none",
-      status: "unavailable",
-      local_only: false,
-      error: "AI inference requires a local worker and is unavailable in the Cloudflare-only deployment."
-    });
-  }
+  if (path === "/api/ai" && method === "GET") return json(await aiStatusPayload(env, user));
   if (path === "/api/storage" && method === "GET") return storageOverview(env);
   if (path === "/api/system" && method === "GET") return json({ platform: "cloudflare", version: "0.1.0" });
-  if (path === "/api/surveillance/status" && method === "GET") {
-    return json({
-      running: false,
-      detector: {
-        active: "none",
-        provider: "cloudflare",
-        model: "none",
-        status: "unavailable",
-        local_only: false,
-        error: "Surveillance workers require a local machine."
-      },
-      cameras: {}
-    });
-  }
   if (parts[1] === "media") return fail("Media files require a local storage service.", 501);
 
   return fail("Not found", 404);

@@ -1,6 +1,7 @@
 export interface EventItem {
   id: number;
   camera_id?: number | null;
+  camera_name?: string | null;
   kind: string;
   object_name?: string | null;
   confidence?: number | null;
@@ -51,10 +52,37 @@ export interface IntegrationInput {
 
 export interface AlertItem {
   id: number;
+  camera_id?: number | null;
+  camera_name?: string | null;
   kind: string;
   message: string;
+  severity: string;
   status: string;
   created_at: string;
+  updated_at?: string;
+}
+
+export interface AiSettings {
+  detection_confidence: number;
+  motion_threshold: number;
+  frame_interval_ms: number;
+  max_objects: number;
+  surveillance_enabled: boolean;
+  alert_severity: "info" | "warning" | "critical" | "none";
+  notify_webhooks: boolean;
+  voice_enabled: boolean;
+  person_only: boolean;
+}
+
+export interface AiSettingsResponse {
+  settings: AiSettings;
+  rows: Array<{ id: number; camera_id: number | null; key: string; value: unknown; enabled: boolean; updated_at: string }>;
+}
+
+export interface AiModel {
+  id: string;
+  kind?: string;
+  endpoint?: string;
 }
 
 export interface AiStatus {
@@ -64,6 +92,28 @@ export interface AiStatus {
   status: string;
   local_only?: boolean;
   error?: string | null;
+  detector?: Record<string, unknown> | null;
+  models?: AiModel[];
+  cameras?: Record<string, unknown>;
+  fps?: number | null;
+  last_frame_at?: string | null;
+  counts?: { cameras: number; events: number; alerts: number; new_alerts: number };
+  recent_events?: EventItem[];
+  recent_alerts?: AlertItem[];
+}
+
+export interface AiChatResponse {
+  answer: string;
+  model?: string | null;
+}
+
+export interface SharingHistoryItem {
+  id: number;
+  username?: string | null;
+  action: string;
+  target: string;
+  camera_id?: number | null;
+  created_at: string;
 }
 
 export interface CameraTestResult {

@@ -19,6 +19,8 @@ const configInterval = Math.max(5000, Number(process.env.BRIDGE_CONFIG_INTERVAL_
 const recordingRoot = process.env.STORAGE_ROOT || path.join(process.cwd(), "recordings");
 const hlsRoot = path.join(recordingRoot, "hls");
 const segmentSeconds = Math.max(30, Number(process.env.RECORDING_SEGMENT_SECONDS || 300));
+const localAiChatUrl = (process.env.LOCAL_AI_CHAT_URL || "http://127.0.0.1:8100").replace(/\/+$/, "");
+const localAiModelsUrl = (process.env.LOCAL_AI_MODELS_URL || "http://127.0.0.1:8200").replace(/\/+$/, "");
 
 const cameras = new Map();
 const sessions = new Map();
@@ -27,6 +29,15 @@ let storageConfig = null;
 let configLoadedAt = 0;
 let configError = "";
 let uploading = false;
+const aiState = {
+  running: true,
+  settings: [],
+  zones: [],
+  models: [],
+  lastFrameAt: null,
+  lastError: null,
+  detections: 0
+};
 
 const sameToken = (value, expected) => {
   if (!expected) return false;
@@ -66,7 +77,12 @@ const getSession = (id, camera) => {
       recordError: "",
       recordRestarts: 0,
       recordGeneration: 0,
-      lastRecordingAt: null
+      lastRecordingAt: null,
+      aiDesired: false,
+      aiLoopActive: false,
+      aiError: null,
+      lastAiFrameAt: null,
+      aiDetections: 0
     };
     sessions.set(Number(id), session);
   }
@@ -211,6 +227,157 @@ const queueUpload = async (session, camera, file, metadata) => {
   await drainUploadQueue();
 };
 
+const aiDefaults = {
+  detection_confidence: 0.55,
+  motion_threshold: 12,
+  frame_interval_ms: 10000,
+  max_objects: 5,
+  surveillance_enabled: true,
+  alert_severity: "warning",
+  notify_webhooks: true,
+  voice_enabled: true,
+  person_only: false
+};
+
+const parseSetting = (raw) => {
+  try { return JSON.parse(String(raw)); } catch { return String(raw); }
+};
+
+const settingsForCamera = (cameraId) => {
+  const settings = { ...aiDefaults };
+  for (const item of aiState.settings) {
+    if (item.enabled === false) continue;
+    if (item.camera_id !== null && Number(item.camera_id) !== Number(cameraId)) continue;
+    settings[item.key] = parseSetting(item.value);
+  }
+  return settings;
+};
+
+const zonesForCamera = (cameraId) => aiState.zones.filter((zone) => Number(zone.camera_id) === Number(cameraId));
+
+const captureFrame = (source) => new Promise((resolve, reject) => {
+  const child = spawn(ffmpegPath, ffmpegArgs(source, true), { stdio: ["ignore", "pipe", "pipe"] });
+  const chunks = [];
+  let stderr = "";
+  let done = false;
+  const timer = setTimeout(() => child.kill("SIGKILL"), 15000);
+  child.stdout.on("data", (chunk) => chunks.push(chunk));
+  child.stderr.on("data", (chunk) => { stderr = redact(`${stderr}${chunk}`, source); });
+  child.once("error", (error) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    reject(new Error(redact(error.message, source)));
+  });
+  child.once("close", () => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    const image = Buffer.concat(chunks);
+    if (image.includes(Buffer.from([0xff, 0xd8]))) resolve(image);
+    else reject(new Error(stderr || "No frame was received from the camera"));
+  });
+});
+
+const reportAiEvent = async (payload) => {
+  const response = await fetch(`${workerUrl}/api/bridge/events`, {
+    method: "POST",
+    headers: { "X-Bridge-Token": token, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(20000)
+  });
+  if (!response.ok) throw new Error(`Event index failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
+  return await response.json().catch(() => ({}));
+};
+
+const analyzeFrame = async (session, camera) => {
+  if (!storageConfig?.endpoint) throw new Error("Storage API is not configured");
+  const settings = settingsForCamera(camera.id);
+  const timestamp = new Date().toISOString();
+  const frame = await captureFrame(camera.source);
+  const form = new FormData();
+  form.append("frame", new Blob([frame], { type: "image/jpeg" }), "frame.jpg");
+  form.append("camera_id", String(camera.id));
+  form.append("camera", safeName(camera.name));
+  form.append("timestamp", timestamp);
+  form.append("zones", JSON.stringify(zonesForCamera(camera.id)));
+  form.append("settings", JSON.stringify(settings));
+  const headers = new Headers();
+  applyStorageAuth(headers, storageConfig);
+  const target = `${storageConfig.endpoint.replace(/\/+$/, "")}/api/storage/ai/detect`;
+  const response = await fetch(target, { method: "POST", headers, body: form, signal: AbortSignal.timeout(45000) });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`AI detection failed (${response.status}): ${text.slice(0, 300)}`);
+  let payload;
+  try { payload = text ? JSON.parse(text) : {}; } catch { throw new Error("AI detection returned invalid JSON"); }
+  const detections = Array.isArray(payload.detections) ? payload.detections : [];
+  for (const detection of detections) {
+    const confidence = Math.min(1, Math.max(0, Number(detection.confidence ?? detection.score ?? 0)));
+    const objectName = String(detection.label ?? detection.class ?? detection.object_name ?? "object");
+    await reportAiEvent({
+      camera_id: camera.id,
+      kind: "detection",
+      object_name: objectName,
+      confidence,
+      occurred_at: String(detection.timestamp ?? timestamp),
+      snapshot_path: String(detection.snapshot_path ?? payload.snapshot_path ?? ""),
+      bounding_box: detection.bounding_box ?? detection.box ?? null,
+      track_id: detection.track_id ?? null,
+      severity: confidence >= 0.85 ? "critical" : String(settings.alert_severity ?? "warning"),
+      description: String(detection.description ?? `${objectName} detected at ${confidence.toFixed(2)} confidence`),
+      alert: detection.alert !== false
+    });
+    session.aiDetections += 1;
+    aiState.detections += 1;
+  }
+  session.lastAiFrameAt = new Date().toISOString();
+  aiState.lastFrameAt = session.lastAiFrameAt;
+};
+
+const aiLoop = async (session) => {
+  if (session.aiLoopActive) return;
+  session.aiLoopActive = true;
+  while (aiState.running && session.aiDesired && session.camera?.source && session.camera?.enabled) {
+    const settings = settingsForCamera(session.id);
+    if (settings.surveillance_enabled === false || session.camera.ai_enabled === false) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      continue;
+    }
+    try {
+      await analyzeFrame(session, session.camera);
+      session.aiError = null;
+      aiState.lastError = null;
+    } catch (error) {
+      session.aiError = error instanceof Error ? error.message : "AI analysis failed";
+      aiState.lastError = session.aiError;
+    }
+    const interval = Math.max(2000, Number(settings.frame_interval_ms) || 10000);
+    await new Promise(resolve => setTimeout(resolve, interval));
+  }
+  session.aiLoopActive = false;
+};
+
+const startAi = (session) => {
+  session.aiDesired = true;
+  if (!session.aiLoopActive) void aiLoop(session);
+};
+
+const stopAi = (session) => {
+  session.aiDesired = false;
+};
+
+const refreshAiModels = async () => {
+  const models = [];
+  try {
+    const response = await fetch(`${localAiModelsUrl}/v1/models`, { signal: AbortSignal.timeout(5000) });
+    if (response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      for (const item of payload.data ?? []) models.push({ id: item.id, kind: "chat", endpoint: localAiModelsUrl });
+    }
+  } catch {}
+  aiState.models = models;
+};
+
 const recordChunk = async (session, source, file) => {
   const args = [
     "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp",
@@ -321,6 +488,8 @@ const stopRecording = (session) => {
 
 const applyConfig = (config) => {
   storageConfig = config.storage || null;
+  aiState.settings = Array.isArray(config.ai_settings) ? config.ai_settings : [];
+  aiState.zones = Array.isArray(config.zones) ? config.zones : [];
   const nextIds = new Set();
   for (const camera of config.cameras || []) {
     nextIds.add(Number(camera.id));
@@ -329,11 +498,14 @@ const applyConfig = (config) => {
     else stopHls(session);
     if (camera.recording_enabled) startRecording(session);
     else stopRecording(session);
+    if (camera.enabled && camera.ai_enabled !== false) startAi(session);
+    else stopAi(session);
   }
   for (const [id, session] of sessions) {
     if (nextIds.has(id)) continue;
     stopHls(session);
     stopRecording(session);
+    stopAi(session);
   }
 };
 
@@ -422,6 +594,43 @@ const sendJson = (response, status, data) => {
   response.end(JSON.stringify(data));
 };
 
+const readJson = async (request) => {
+  const text = await request.text();
+  if (!text) return {};
+  try { return JSON.parse(text); } catch { throw new Error("Invalid JSON body"); }
+};
+
+const aiStatus = () => {
+  const cameras = {};
+  for (const session of sessions.values()) {
+    cameras[String(session.id)] = {
+      enabled: !!session.camera?.enabled,
+      ai_enabled: session.camera?.ai_enabled !== false,
+      running: session.aiLoopActive && aiState.running,
+      last_frame_at: session.lastAiFrameAt,
+      detections: session.aiDetections,
+      error: session.aiError
+    };
+  }
+  return {
+    running: aiState.running,
+    detector: {
+      active: "hybrid-cv",
+      provider: "local-storage-api",
+      model: "opencv-cascade+motion",
+      status: aiState.running ? "running" : "stopped",
+      local_only: true,
+      error: aiState.lastError
+    },
+    models: aiState.models,
+    cameras,
+    fps: aiState.lastFrameAt ? Math.round((1 / Math.max(1, Number(settingsForCamera([...sessions.keys()][0] ?? 0).frame_interval_ms || 10000) / 1000)) * 100) / 100 : null,
+    last_frame_at: aiState.lastFrameAt,
+    detections: aiState.detections,
+    error: aiState.lastError
+  };
+};
+
 const hlsStatus = (session) => {
   const playlist = path.join(hlsRoot, String(session.id), "index.m3u8");
   let lastFrameAt = null;
@@ -478,7 +687,7 @@ const hlsSegment = (response, session, segment) => {
   response.end(readFileSync(file));
 };
 
-http.createServer((request, response) => {
+http.createServer(async (request, response) => {
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
   const pathname = url.pathname;
 
@@ -499,6 +708,62 @@ http.createServer((request, response) => {
       generated_at: new Date().toISOString(),
       cameras: [...sessions.values()].map(hlsStatus)
     });
+    return;
+  }
+
+  if (pathname === "/ai/status" && request.method === "GET") {
+    sendJson(response, 200, aiStatus());
+    return;
+  }
+  if (pathname === "/ai/models" && request.method === "GET") {
+    sendJson(response, 200, { models: aiState.models });
+    return;
+  }
+  if (pathname === "/ai/start" && request.method === "POST") {
+    const data = await readJson(request).catch(() => ({}));
+    aiState.running = true;
+    const cameraId = Number(data.camera_id);
+    if (Number.isFinite(cameraId) && cameraId > 0) {
+      const session = getSession(cameraId);
+      startAi(session);
+    } else {
+      for (const session of sessions.values()) startAi(session);
+    }
+    sendJson(response, 200, aiStatus());
+    return;
+  }
+  if (pathname === "/ai/stop" && request.method === "POST") {
+    const data = await readJson(request).catch(() => ({}));
+    const cameraId = Number(data.camera_id);
+    if (Number.isFinite(cameraId) && cameraId > 0) stopAi(getSession(cameraId));
+    else aiState.running = false;
+    sendJson(response, 200, aiStatus());
+    return;
+  }
+  if (pathname === "/ai/chat" && request.method === "POST") {
+    try {
+      const data = await readJson(request);
+      const message = String(data.message ?? "").trim();
+      if (!message) throw new Error("Message is required");
+      const context = Array.isArray(data.context) ? data.context : [];
+      const prompt = context.length ? `Use only these real LocalVision events and alerts to answer. If the answer is not present, say so.\n\n${context.join("\n")}\n\nQuestion: ${message}` : message;
+      const upstream = await fetch(`${localAiChatUrl}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: prompt, history: Array.isArray(data.history) ? data.history : [], max_new_tokens: 512, temperature: 0.2 }),
+        signal: AbortSignal.timeout(60000)
+      });
+      const text = await upstream.text();
+      if (!upstream.ok) throw new Error(`Local AI returned HTTP ${upstream.status}: ${text.slice(0, 300)}`);
+      let payload;
+      try { payload = JSON.parse(text); } catch { payload = { answer: text }; }
+      sendJson(response, 200, {
+        answer: String(payload.answer ?? payload.response ?? payload.message ?? payload.text ?? ""),
+        model: payload.model ?? null
+      });
+    } catch (error) {
+      sendJson(response, 502, { detail: error instanceof Error ? error.message : "Local AI request failed" });
+    }
     return;
   }
 
@@ -577,3 +842,5 @@ http.createServer((request, response) => {
 loadConfig().catch((error) => { configError = error instanceof Error ? error.message : "Configuration load failed"; });
 setInterval(() => loadConfig().catch((error) => { configError = error instanceof Error ? error.message : "Configuration load failed"; }), configInterval);
 setInterval(() => void drainUploadQueue(), 15000);
+void refreshAiModels();
+setInterval(() => void refreshAiModels(), 60000);

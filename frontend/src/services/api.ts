@@ -1,6 +1,6 @@
 import type { Camera, CameraInput, CameraStatus } from "../types/camera";
 import type { RecordingPage, Zone, ZoneInput } from "../types/recording";
-import type { AiStatus, AlertItem, DiscoveryResult, EventItem, Integration, IntegrationInput, Metrics } from "../types/operations";
+import type { AiChatResponse, AiModel, AiSettings, AiSettingsResponse, AiStatus, AlertItem, DiscoveryResult, EventItem, Integration, IntegrationInput, Metrics, SharingHistoryItem } from "../types/operations";
 import type { LoginResponse, Role, Share, User, UserRecord } from "../types/auth";
 import type { StorageIntegration, StorageIntegrationInput, StorageOverview, StorageProbe, StorageRecording } from "../types/storage";
 import type { MonitoringFilters, MonitoringOverview, MonitoringUserDetail } from "../types/monitoring";
@@ -77,14 +77,27 @@ export interface EventFilters {
   page_size?: number;
 }
 
+export interface AlertFilters {
+  status?: string;
+  severity?: string;
+}
+
 export const operationsApi = {
   events: (filters: EventFilters = {}) => request<{ items: EventItem[]; page: number; page_size: number }>(`/api/events?${queryString(filters)}`),
   detections: (filters: EventFilters = {}) => request<{ items: EventItem[]; page: number; page_size: number }>(`/api/detections?${queryString(filters)}`),
-  alerts: () => request<AlertItem[]>("/api/alerts"),
-  acknowledgeAlert: (id: number) => request<AlertItem>(`/api/alerts/${id}`, { method: "PATCH" }),
+  alerts: (filters: AlertFilters = {}) => request<AlertItem[]>(`/api/alerts?${queryString(filters)}`),
+  updateAlert: (id: number, status: "new" | "acknowledged" | "resolved") => request<AlertItem>(`/api/alerts/${id}`, { method: "PATCH", body: JSON.stringify({ status }) }),
+  acknowledgeAlert: (id: number) => operationsApi.updateAlert(id, "acknowledged"),
   metrics: () => request<Metrics>("/api/metrics"),
   ai: () => request<AiStatus>("/api/ai"),
-  surveillance: () => request<{ running: boolean; detector: AiStatus; cameras: Record<string, { status: string; message?: string | null }> }>("/api/surveillance/status")
+  aiStatus: () => request<AiStatus>("/api/ai/status"),
+  aiModels: () => request<{ models: AiModel[]; error?: string }>("/api/ai/models"),
+  aiAsk: (question: string, history: Array<{ role: string; content: string }> = []) => request<AiChatResponse>("/api/ai/ask", { method: "POST", body: JSON.stringify({ question, history }) }),
+  aiSettings: (cameraId?: number) => request<AiSettingsResponse>(`/api/ai/settings?${queryString({ camera_id: cameraId })}`),
+  saveAiSettings: (settings: Partial<AiSettings>, cameraId?: number) => request<AiSettingsResponse>(`/api/ai/settings?${queryString({ camera_id: cameraId })}`, { method: "POST", body: JSON.stringify({ settings }) }),
+  aiSnapshotUrl: (cameraId: number, path: string) => `/api/ai/snapshot?camera_id=${cameraId}&path=${encodeURIComponent(path)}`,
+  surveillance: () => request<AiStatus>("/api/surveillance/status"),
+  surveillanceControl: (action: "start" | "stop", cameraId?: number) => request<AiStatus>(`/api/surveillance/${action}`, { method: "POST", body: JSON.stringify({ camera_id: cameraId }) })
 };
 
 export const monitoringApi = { metrics: () => request<Metrics>("/api/metrics") };
@@ -135,5 +148,7 @@ export const settingsApi = { get: () => request<{ version: string; environment: 
 export const sharingApi = {
   list: (cameraId: number) => request<Share[]>(`/api/cameras/${cameraId}/shares`),
   create: (cameraId: number, input: { username: string; permission: "viewer" | "operator" }) => request<Share>(`/api/cameras/${cameraId}/shares`, { method: "POST", body: JSON.stringify(input) }),
-  remove: (cameraId: number, shareId: number) => request<void>(`/api/cameras/${cameraId}/shares/${shareId}`, { method: "DELETE" })
+  update: (cameraId: number, shareId: number, permission: "viewer" | "operator") => request<Share>(`/api/cameras/${cameraId}/shares/${shareId}`, { method: "PATCH", body: JSON.stringify({ permission }) }),
+  remove: (cameraId: number, shareId: number) => request<void>(`/api/cameras/${cameraId}/shares/${shareId}`, { method: "DELETE" }),
+  history: () => request<SharingHistoryItem[]>("/api/sharing/history")
 };
