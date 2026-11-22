@@ -329,7 +329,7 @@ const analyzeFrame = async (session, camera) => {
       confidence,
       occurred_at: String(detection.timestamp ?? timestamp),
       snapshot_path: String(detection.snapshot_path ?? payload.snapshot_path ?? ""),
-      bounding_box: detection.bounding_box ?? detection.box ?? null,
+      bounding_box: (detection.bounding_box || detection.box) ? { ...(detection.bounding_box || detection.box), frame_width: detection.frame_width ?? (detection.bounding_box || detection.box)?.frame_width, frame_height: detection.frame_height ?? (detection.bounding_box || detection.box)?.frame_height } : null,
       track_id: detection.track_id ?? null,
       severity: confidence >= 0.85 ? "critical" : String(settings.alert_severity ?? "warning"),
       description: String(detection.description ?? `${objectName} detected at ${confidence.toFixed(2)} confidence`),

@@ -87,6 +87,7 @@ export interface AlertFilters {
 export const operationsApi = {
   events: (filters: EventFilters = {}) => request<{ items: EventItem[]; page: number; page_size: number }>(`/api/events?${queryString(filters)}`),
   personSessions: (filters: { camera_id?: number; status?: string; search?: string; start?: string; end?: string; page_size?: number } = {}) => request<{ items: PersonSession[]; page: number; page_size: number }>(`/api/person-sessions?${queryString(filters)}`),
+  heatmap: (filters: { camera_id?: number; period?: string; date?: string; compare?: boolean } = {}) => request<any>(`/api/heatmaps?${queryString(filters)}`),
   detections: (filters: EventFilters = {}) => request<{ items: EventItem[]; page: number; page_size: number }>(`/api/detections?${queryString(filters)}`),
   alerts: (filters: AlertFilters = {}) => request<AlertItem[]>(`/api/alerts?${queryString(filters)}`),
   updateAlert: (id: number, status: "new" | "acknowledged" | "resolved") => request<AlertItem>(`/api/alerts/${id}`, { method: "PATCH", body: JSON.stringify({ status }) }),

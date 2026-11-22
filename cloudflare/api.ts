@@ -2575,6 +2575,130 @@ const personSessionsRoute = async (request: Request, env: Env, parts: string[], 
   return fail("Not found", 404);
 };
 
+const periodRange = (period: string, date: string) => {
+  const base = new Date(`${date}T00:00:00`);
+  if (period === "week") {
+    const day = base.getDay();
+    const diff = day === 0 ? 6 : day - 1;
+    const start = new Date(base);
+    start.setDate(base.getDate() - diff);
+    const end = new Date(start);
+    end.setDate(start.getDate() + 6);
+    end.setHours(23, 59, 59, 999);
+    return { start: start.toISOString(), end: end.toISOString() };
+  }
+  if (period === "month") {
+    const start = new Date(base.getFullYear(), base.getMonth(), 1);
+    const end = new Date(base.getFullYear(), base.getMonth() + 1, 0, 23, 59, 59, 999);
+    return { start: start.toISOString(), end: end.toISOString() };
+  }
+  const start = new Date(base);
+  const end = new Date(base);
+  end.setHours(23, 59, 59, 999);
+  return { start: start.toISOString(), end: end.toISOString() };
+};
+
+const shiftRange = (start: string, end: string, period: string) => {
+  const s = new Date(start);
+  const e = new Date(end);
+  const days = period === "month" ? 0 : period === "week" ? 7 : 1;
+  if (period === "month") {
+    s.setMonth(s.getMonth() - 1);
+    e.setMonth(e.getMonth() - 1);
+    // adjust end to last day of previous month
+    const last = new Date(e.getFullYear(), e.getMonth() + 1, 0, 23, 59, 59, 999);
+    return { start: s.toISOString(), end: last.toISOString() };
+  }
+  s.setDate(s.getDate() - days);
+  e.setDate(e.getDate() - days);
+  return { start: s.toISOString(), end: e.toISOString() };
+};
+
+const aggregateHeatmap = async (env: Env, db: any, user: any, cameraId: number | null, start: string, end: string) => {
+  const ids = await accessibleCameraIds(db, user);
+  if (cameraId && !ids.includes(cameraId)) {
+    return { grid: Array.from({ length: 16 }, () => Array(16).fill(0)), peak_hours: Array(24).fill(0), occupancy_by_hour: Array(24).fill(0), total_events: 0, sessions: 0, avg_duration_seconds: null, total_duration_seconds: 0 };
+  }
+  const params: any[] = [start, end];
+  let sql = "SELECT e.bounding_box, e.occurred_at, e.camera_id FROM events e WHERE e.occurred_at>=? AND e.occurred_at<=? AND LOWER(COALESCE(e.object_name,''))='person'";
+  if (cameraId) { sql += " AND e.camera_id=?"; params.push(cameraId); }
+  else { sql += cameraFilterSql(ids, params, "e.camera_id", isAdmin(user)); }
+  const rows = await all(db, sql, ...params);
+  const grid = Array.from({ length: 16 }, () => Array(16).fill(0));
+  const peak = Array(24).fill(0);
+  for (const row of rows) {
+    const occurred = String(row.occurred_at ?? "");
+    const hour = Number(occurred.slice(11, 13));
+    if (Number.isFinite(hour) && hour >= 0 && hour < 24) peak[hour] += 1;
+    let box: any = null;
+    try { box = row.bounding_box ? JSON.parse(row.bounding_box) : null; } catch { box = null; }
+    if (box) {
+      const fw = Number(box.frame_width ?? box.frameWidth ?? 0);
+      const fh = Number(box.frame_height ?? box.frameHeight ?? 0);
+      const x = Number(box.x ?? 0);
+      const y = Number(box.y ?? 0);
+      const w = Number(box.width ?? 0);
+      const h = Number(box.height ?? 0);
+      let nx = 0.5, ny = 0.5;
+      if (fw > 0 && fh > 0) {
+        nx = (x + w / 2) / fw;
+        ny = (y + h / 2) / fh;
+      } else if (x + w <= 1 && y + h <= 1) {
+        nx = x + w / 2;
+        ny = y + h / 2;
+      }
+      nx = Math.min(0.999, Math.max(0, nx));
+      ny = Math.min(0.999, Math.max(0, ny));
+      const cx = Math.floor(nx * 16);
+      const cy = Math.floor(ny * 16);
+      grid[cy][cx] += 1;
+    }
+  }
+  // occupancy from person sessions in range
+  const sessionParams: any[] = [start, end];
+  let sessionSql = "SELECT * FROM person_sessions WHERE entry_at>=? AND entry_at<=?";
+  if (cameraId) { sessionSql += " AND camera_id=?"; sessionParams.push(cameraId); }
+  else { sessionSql += cameraFilterSql(ids, sessionParams, "camera_id", isAdmin(user)); }
+  const sessions = await all(db, sessionSql, ...sessionParams);
+  const occ = Array(24).fill(0);
+  for (const s of sessions) {
+    const entryHour = Number(String(s.entry_at ?? "").slice(11, 13));
+    if (Number.isFinite(entryHour) && entryHour >= 0 && entryHour < 24) occ[entryHour] += 1;
+  }
+  const durations = sessions.map((s: any) => Number(s.duration_seconds ?? 0)).filter((n: number) => Number.isFinite(n));
+  const avg = durations.length ? durations.reduce((a: number, b: number) => a + b, 0) / durations.length : null;
+  const totalDur = durations.reduce((a: number, b: number) => a + b, 0);
+  return {
+    grid,
+    peak_hours: peak,
+    occupancy_by_hour: occ,
+    total_events: rows.length,
+    sessions: sessions.length,
+    avg_duration_seconds: avg,
+    total_duration_seconds: totalDur
+  };
+};
+
+const heatmapRoute = async (request: Request, env: Env, url: URL, user: any): Promise<Response> => {
+  const period = String(url.searchParams.get("period") ?? "day").toLowerCase();
+  const safePeriod = ["day", "week", "month"].includes(period) ? period : "day";
+  const date = String(url.searchParams.get("date") ?? new Date().toISOString().slice(0, 10));
+  const cameraIdRaw = url.searchParams.get("camera_id");
+  const cameraId = cameraIdRaw ? Number(cameraIdRaw) : null;
+  const compare = url.searchParams.get("compare") !== "false";
+  const currentRange = periodRange(safePeriod, date);
+  const current = await aggregateHeatmap(env, env.DB, user, cameraId, currentRange.start, currentRange.end);
+  const previousRange = shiftRange(currentRange.start, currentRange.end, safePeriod);
+  const previous = compare ? await aggregateHeatmap(env, env.DB, user, cameraId, previousRange.start, previousRange.end) : null;
+  return json({
+    period: safePeriod,
+    date,
+    camera_id: cameraId,
+    current: { ...current, start: currentRange.start, end: currentRange.end },
+    previous: previous ? { ...previous, start: previousRange.start, end: previousRange.end } : null
+  });
+};
+
 const alertsRoute = async (request: Request, env: Env, parts: string[], method: string, url: URL, user: any): Promise<Response> => {
   const ids = await accessibleCameraIds(env.DB, user);
   if (parts.length === 2 && method === "GET") {
@@ -2754,6 +2878,7 @@ const route = async (request: Request, env: Env): Promise<Response> => {
     return json(await eventsRoute(env, url, user, path === "/api/detections"));
   }
   if (parts[1] === "person-sessions") return personSessionsRoute(request, env, parts, method, url, user);
+  if (path === "/api/heatmaps" && method === "GET") return heatmapRoute(request, env, url, user);
 
   if (parts[1] === "alerts") return alertsRoute(request, env, parts, method, url, user);
   if (path === "/api/sharing/history" && method === "GET") return sharingHistoryRoute(env, user);

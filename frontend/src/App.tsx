@@ -11,6 +11,7 @@ import { ZoneEditor } from "./pages/ZoneEditor";
 import { LivePage } from "./pages/LivePage";
 import { AIHub } from "./pages/AIHub";
 import { EventsPage } from "./pages/EventsPage";
+import { HeatmapPage } from "./pages/HeatmapPage";
 import { AlertsPage } from "./pages/AlertsPage";
 import { IntegrationsPage } from "./pages/IntegrationsPage";
 import { SystemPage } from "./pages/SystemPage";
@@ -119,6 +120,7 @@ export default function App() {
     : page === "recordings" ? <RecordingsPage cameras={cameras} />
     : page === "ai" ? <AIHub cameras={cameras} canWrite={canWrite} />
     : page === "events" ? <EventsPage cameras={cameras} />
+    : page === "heatmap" ? <HeatmapPage cameras={cameras} />
     : page === "alerts" ? <AlertsPage canWrite={canWrite} />
     : page === "sharing" ? <SharingPage canWrite={canWrite} />
     : page === "storage" ? (user.role === "admin" ? <StoragePage /> : <PlaceholderPage title="Storage access restricted" description="Only administrators can review global storage capacity and server connections." />)

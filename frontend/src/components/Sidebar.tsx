@@ -1,7 +1,7 @@
 import { AICameraLogo } from "./AICameraLogo";
 
 interface Props { active: string; role?: string; onNavigate: (page: string) => void; }
-const items = [["dashboard", "⌂", "Dashboard"], ["live", "◉", "Live View"], ["cameras", "▣", "Cameras"], ["recordings", "▤", "Recordings"], ["events", "◌", "Event Center"], ["ai", "✦", "AI Center"], ["alerts", "!", "Alert Center"], ["sharing", "↗", "Sharing"], ["storage", "▥", "Storage"], ["users", "♙", "Users"], ["integrations", "↗", "Integrations"], ["settings", "⚙", "Settings"], ["system", "◌", "System"]];
+const items = [["dashboard", "⌂", "Dashboard"], ["live", "◉", "Live View"], ["cameras", "▣", "Cameras"], ["recordings", "▤", "Recordings"], ["events", "◌", "Event Center"], ["heatmap", "熱", "AI Heatmap"], ["ai", "✦", "AI Center"], ["alerts", "!", "Alert Center"], ["sharing", "↗", "Sharing"], ["storage", "▥", "Storage"], ["users", "♙", "Users"], ["integrations", "↗", "Integrations"], ["settings", "⚙", "Settings"], ["system", "◌", "System"]];
 const adminOnly = new Set(["storage", "users", "system"]);
 
 export function Sidebar({ active, role, onNavigate }: Props) {
