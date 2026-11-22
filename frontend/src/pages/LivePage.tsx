@@ -88,7 +88,7 @@ export function LivePage({ cameras, detections }: Props) {
 
   useEffect(() => {
     void refresh();
-    timer.current = window.setInterval(() => void refresh(), 5000);
+    timer.current = window.setInterval(() => void refresh(), 10000);
     return () => {
       if (timer.current !== null) window.clearInterval(timer.current);
     };

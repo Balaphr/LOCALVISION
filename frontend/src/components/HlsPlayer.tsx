@@ -41,13 +41,13 @@ export function HlsPlayer({ src, className }: Props) {
       retries += 1;
       setError("Reconnecting…");
       clearReload();
-      reloadTimer = window.setTimeout(() => {
-        reloadTimer = null;
-        destroyHls();
-        video.removeAttribute("src");
-        video.load();
-        start();
-      }, Math.min(8000, 500 * retries));
+reloadTimer = window.setTimeout(() => {
+         reloadTimer = null;
+         destroyHls();
+         video.removeAttribute("src");
+         video.load();
+         start();
+       }, Math.min(5000, 1000 * retries));
     };
 
     const start = () => {
@@ -65,20 +65,22 @@ export function HlsPlayer({ src, className }: Props) {
         setError("HLS is not supported by this browser");
         return;
       }
-      hls = new Hls({
-        lowLatencyMode: true,
-        backBufferLength: 10,
-        enableWorker: true,
-        manifestLoadingMaxRetry: 6,
-        manifestLoadingRetryDelay: 500,
-        levelLoadingMaxRetry: 6,
-        levelLoadingRetryDelay: 500,
-        fragLoadingMaxRetry: 6,
-        fragLoadingRetryDelay: 500,
-        liveSyncDurationCount: 3,
-        liveMaxLatencyDurationCount: 8,
-        maxLiveSyncPlaybackRate: 1.5
-      });
+hls = new Hls({
+         lowLatencyMode: true,
+         backBufferLength: 6,
+         maxBufferLength: 8,
+         maxMaxBufferLength: 16,
+         enableWorker: true,
+         manifestLoadingMaxRetry: 8,
+         manifestLoadingRetryDelay: 1000,
+         levelLoadingMaxRetry: 8,
+         levelLoadingRetryDelay: 1000,
+         fragLoadingMaxRetry: 8,
+         fragLoadingRetryDelay: 1000,
+         liveSyncDurationCount: 2,
+         liveMaxLatencyDurationCount: 6,
+         maxLiveSyncPlaybackRate: 1.2
+       });
       hls.loadSource(src);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -118,7 +120,7 @@ export function HlsPlayer({ src, className }: Props) {
         lastProgress = Date.now();
         return;
       }
-      if (Date.now() - lastProgress > 10000) reconnect();
+      if (Date.now() - lastProgress > 15000) reconnect();
     }, 2000);
 
     return () => {
