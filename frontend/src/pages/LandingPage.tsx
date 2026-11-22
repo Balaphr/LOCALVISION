@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { LoginPage } from "./LoginPage";
 import type { User } from "../types/auth";
+import { AICameraLogo } from "../components/AICameraLogo";
 
 interface Props { onAuthenticated: (user: User) => void; }
 
@@ -70,10 +71,7 @@ export function LandingPage({ onAuthenticated }: Props) {
     <main className="landing-shell" ref={rootRef}>
       <nav className="landing-nav">
         <div className="landing-brand">
-          <span className="brand-mark camera-logo landing-logo" aria-hidden="true">
-            <span className="camera-mount" />
-            <span className="camera-body"><span className="camera-lens" /><span className="camera-status" /></span>
-          </span>
+          <span className="brand-mark landing-logo" aria-hidden="true"><AICameraLogo /></span>
           <span><b>LOCALVISION AI</b></span>
         </div>
         <div className="landing-nav-actions">
