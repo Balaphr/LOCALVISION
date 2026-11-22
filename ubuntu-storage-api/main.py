@@ -18,7 +18,9 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 load_dotenv("/opt/localvision-storage/.env")
 
 ROOT = Path(os.environ["STORAGE_ROOT"]).resolve()
-RECORDINGS = ROOT / "recordings"
+STORAGE = ROOT / "Storage"
+LEGACY_RECORDINGS = ROOT / "recordings"
+RECORDINGS = STORAGE
 SNAPSHOTS = ROOT / "snapshots"
 API_KEY = os.environ["STORAGE_API_KEY"]
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
@@ -109,6 +111,66 @@ def valid_duration(value: str) -> float | None:
 
 def recording_id(camera: str, date: str, filename: str) -> str:
     return f"{camera}|{date}|{filename}"
+
+
+def recording_roots() -> list:
+    return [STORAGE, LEGACY_RECORDINGS]
+
+
+def parse_recording_id(value: str):
+    parts = value.split("|")
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail="Invalid recording id")
+    return safe_camera(parts[0]), valid_date(parts[1]), safe_filename(parts[2])
+
+
+def find_recording(camera: str, date: str, filename: str) -> Path:
+    for root in recording_roots():
+        candidate = (root / camera / date / filename).resolve()
+        if not candidate.is_relative_to(root.resolve()):
+            raise HTTPException(status_code=400, detail="Invalid path")
+        if candidate.is_file():
+            return candidate
+    raise HTTPException(status_code=404, detail="Recording not found")
+
+
+def camera_id_from_name(camera: str):
+    match = re.fullmatch(r"Camera-(\d+)", camera, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def review_sidecar(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".review.json")
+
+
+def read_review(path: Path) -> dict:
+    sidecar = review_sidecar(path)
+    if not sidecar.is_file():
+        return {"review_status": "unreviewed", "reviewed_by": None, "reviewed_at": None, "review_notes": None}
+    try:
+        data = json.loads(sidecar.read_text("utf-8"))
+    except (OSError, ValueError):
+        return {"review_status": "unreviewed", "reviewed_by": None, "reviewed_at": None, "review_notes": None}
+    return {
+        "review_status": str(data.get("review_status", "unreviewed")),
+        "reviewed_by": data.get("reviewed_by"),
+        "reviewed_at": data.get("reviewed_at"),
+        "review_notes": data.get("notes"),
+    }
+
+
+def write_review(path: Path, data: dict) -> dict:
+    payload = {
+        "review_status": str(data.get("status", "reviewed")),
+        "reviewed_by": data.get("reviewed_by"),
+        "reviewed_at": data.get("reviewed_at") or datetime.now(timezone.utc).isoformat(),
+        "notes": data.get("notes"),
+    }
+    sidecar = review_sidecar(path)
+    temp = sidecar.with_suffix(".tmp")
+    temp.write_text(json.dumps(payload), "utf-8")
+    os.replace(temp, sidecar)
+    return payload
 
 
 def load_cascade(name: str):
@@ -226,6 +288,8 @@ def analyze_frame(camera_id: int, camera: str, timestamp: str, frame_bytes: byte
             "object_name": label,
             "confidence": round(confidence, 3),
             "bounding_box": {"x": x, "y": y, "width": box_width, "height": box_height, "area": area},
+            "frame_width": width,
+            "frame_height": height,
             "timestamp": timestamp,
             "description": f"{label} detected in camera view"
         })
@@ -330,18 +394,58 @@ def recordings(camera: str = "", date: str = "", _: bool = Depends(authenticate)
             continue
         if date and file_date != date:
             continue
-        items.append({
-            "id": recording_id(file_camera, file_date, file.name),
-            "name": file.name,
-            "camera": file_camera,
-            "date": file_date,
-            "path": str(relative),
-            "filename": file.name,
-            "size_bytes": file.stat().st_size,
-            "modified": datetime.fromtimestamp(file.stat().st_mtime, timezone.utc).isoformat(),
-            "mime_type": mimetypes.guess_type(file.name)[0] or "video/mp4"
-        })
+    review = read_review(file)
+    items.append({
+        "id": recording_id(file_camera, file_date, file.name),
+        "name": file.name,
+        "camera": file_camera,
+        "date": file_date,
+        "path": str(relative),
+        "filename": file.name,
+        "size_bytes": file.stat().st_size,
+        "modified": datetime.fromtimestamp(file.stat().st_mtime, timezone.utc).isoformat(),
+        "mime_type": mimetypes.guess_type(file.name)[0] or "video/mp4",
+        "review_status": review.get("review_status", "unreviewed"),
+        "reviewed_by": review.get("reviewed_by"),
+        "reviewed_at": review.get("reviewed_at"),
+    })
     return {"camera": camera_name, "date": date, "recordings": items}
+
+
+@app.delete("/api/recordings/{recording_id}")
+def delete_recording(recording_id: str, _: bool = Depends(authenticate)):
+    camera, date_value, filename = parse_recording_id(recording_id)
+    path = find_recording(camera, date_value, filename)
+    path.unlink(missing_ok=True)
+    review_sidecar(path).unlink(missing_ok=True)
+    return {"deleted": True, "id": recording_id}
+
+
+@app.api_route("/api/recordings/{recording_id}/review", methods=["POST", "PATCH", "PUT"])
+async def review_recording(recording_id: str, request: Request, _: bool = Depends(authenticate)):
+    camera, date_value, filename = parse_recording_id(recording_id)
+    path = find_recording(camera, date_value, filename)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    payload = write_review(path, data)
+    review = read_review(path)
+    return {
+        "id": recording_id,
+        "camera": camera,
+        "date": date_value,
+        "filename": filename,
+        "path": str(path.relative_to(ROOT)),
+        "size_bytes": path.stat().st_size,
+        "review_status": review.get("review_status", "unreviewed"),
+        "reviewed_by": review.get("reviewed_by"),
+        "reviewed_at": review.get("reviewed_at"),
+        "review_notes": review.get("review_notes"),
+        "notes": payload.get("notes"),
+    }
 
 
 @app.post("/api/storage/upload")

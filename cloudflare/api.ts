@@ -857,11 +857,71 @@ const recordingView = (row: any) => ({
   size_bytes: Number(row.size_bytes ?? 0) || 0,
   kind: "continuous",
   status: row.status ?? "ready",
+  review_status: row.review_status ?? "unreviewed",
+  reviewed_by: row.reviewed_by ?? null,
+  reviewed_at: row.reviewed_at ?? null,
   storage_server_id: row.storage_server_id ?? null,
   storage_recording_id: row.storage_recording_id ?? null,
   fileUrl: row.storage_server_id && row.storage_recording_id ? `/api/recordings/${row.id}/file` : null,
   downloadUrl: row.storage_server_id && row.storage_recording_id ? `/api/recordings/${row.id}/download` : null
 });
+
+const storedRecordingId = (row: any) => String(row.storage_recording_id ?? `${row.camera ?? row.camera_id ?? "Camera"}|${row.date ?? ""}|${row.filename ?? "recording.mp4"}`);
+
+const deleteStoredRecording = async (request: Request, env: Env, row: any) => {
+  const server = row.storage_server_id
+    ? await first(env.DB, "SELECT * FROM storage_servers WHERE id=?", Number(row.storage_server_id))
+    : await first(env.DB, "SELECT * FROM storage_servers WHERE enabled=1 ORDER BY id LIMIT 1");
+  if (!server) throw new Error("No configured storage server is available to delete this file");
+  const id = storedRecordingId(row);
+  const response = await storageFetch(env, server, `api/recordings/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!response.ok && response.status !== 404) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`Storage API returned HTTP ${response.status}: ${detail.slice(0, 300)}`);
+  }
+  return { deleted: response.ok, storage_server_id: Number(server.id) };
+};
+
+const recordingRowFor = async (env: Env, id: number) => {
+  const existing = await first(env.DB, "SELECT * FROM camera_recordings WHERE id=?", id);
+  if (existing) return existing;
+  if (id >= 0) return null;
+  const views = await storageRecordingViews(env.DB, env);
+  const view = views.find(item => Number(item.id) === id);
+  if (!view) return null;
+  const cameraId = Number(view.camera_id) > 0 ? Number(view.camera_id) : null;
+  if (!cameraId) return null;
+  const storageId = String(view.storage_recording_id ?? "");
+  const byStorage = storageId
+    ? await first(env.DB, "SELECT * FROM camera_recordings WHERE storage_server_id=? AND storage_recording_id=?", view.storage_server_id, storageId)
+    : null;
+  if (byStorage) return byStorage;
+  const startedAt = String(view.started_at ?? stamp());
+  await run(
+    env.DB,
+    `INSERT INTO camera_recordings (camera_id,storage_server_id,storage_recording_id,name,camera,date,time,filename,duration_seconds,size_bytes,status,started_at,ended_at,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    cameraId,
+    view.storage_server_id ?? null,
+    storageId || null,
+    view.name ?? view.filename ?? "recording.mp4",
+    view.camera ?? `Camera ${cameraId}`,
+    view.date ?? startedAt.slice(0, 10),
+    view.time ?? startedAt.slice(11, 19),
+    view.filename ?? "recording.mp4",
+    view.duration_seconds ?? null,
+    Number(view.size_bytes ?? 0) || 0,
+    view.status ?? "ready",
+    startedAt,
+    view.ended_at ?? null,
+    stamp(),
+    stamp()
+  );
+  const saved = storageId
+    ? await first(env.DB, "SELECT * FROM camera_recordings WHERE storage_server_id=? AND storage_recording_id=?", view.storage_server_id, storageId)
+    : await first(env.DB, "SELECT * FROM camera_recordings WHERE camera_id=? AND filename=? ORDER BY id DESC LIMIT 1", cameraId, view.filename ?? "recording.mp4");
+  return saved;
+};
 
 const recordingsRoute = async (request: Request, env: Env, parts: string[], method: string, url: URL, user: any): Promise<Response> => {
   const db = env.DB;
@@ -900,14 +960,64 @@ const recordingsRoute = async (request: Request, env: Env, parts: string[], meth
   }
   const id = Number(parts[2]);
   if (!Number.isFinite(id)) return fail("Recording not found", 404);
-  const row = await first(db, "SELECT * FROM camera_recordings WHERE id=?", id);
+  const row = await recordingRowFor(env, id);
   if (!row) return fail("Recording not found", 404);
-  const recordingAccess = await cameraFor(db, user, row.camera_id, method === "DELETE" ? "owner" : "view");
+  const accessMode = method === "DELETE" ? "owner" : parts[3] === "review" ? "manage" : "view";
+  const recordingAccess = await cameraFor(db, user, Number(row.camera_id), accessMode);
   if (recordingAccess instanceof Response) return recordingAccess;
   if (parts.length === 3 && method === "DELETE") {
-    await run(db, "DELETE FROM camera_recordings WHERE id=?", id);
-    await audit(request, env, user, "recording.deleted", String(id));
-    return empty();
+    try {
+      const removed = await deleteStoredRecording(request, env, row);
+      if (Number(row.id) > 0) {
+        await run(db, "DELETE FROM camera_recordings WHERE id=?", row.id);
+        await run(db, "DELETE FROM recording_review_history WHERE recording_id=?", row.id);
+      }
+      await audit(request, env, user, "recording.deleted", `${row.id}|${storedRecordingId(row)}|${row.filename ?? ""}`, Number(row.camera_id));
+      return json({ deleted: true, storage_deleted: removed.deleted, storage_server_id: removed.storage_server_id });
+    } catch (error: any) {
+      return fail(error?.message || "Could not delete the stored recording", 502);
+    }
+  }
+  if (parts.length === 4 && parts[3] === "review" && ["POST", "PATCH", "PUT"].includes(method)) {
+    const data = await bodyOf(request);
+    const status = String(data.status ?? "reviewed").trim().toLowerCase();
+    if (!["unreviewed", "reviewed", "flagged"].includes(status)) return fail("Review status must be unreviewed, reviewed, or flagged", 422);
+    const previous = String(row.review_status ?? "unreviewed");
+    const notes = String(data.notes ?? "").slice(0, 2000);
+    const reviewedAt = stamp();
+    await run(db, "UPDATE camera_recordings SET review_status=?,reviewed_by=?,reviewed_at=?,updated_at=? WHERE id=?", status, user.username ?? null, reviewedAt, reviewedAt, row.id);
+    await run(
+      db,
+      "INSERT INTO recording_review_history (recording_id,camera_id,storage_recording_id,previous_status,review_status,reviewed_by,notes,created_at) VALUES (?,?,?,?,?,?,?,?)",
+      row.id,
+      row.camera_id,
+      row.storage_recording_id ?? null,
+      previous,
+      status,
+      user.username ?? null,
+      notes || null,
+      reviewedAt
+    );
+    try {
+      const server = row.storage_server_id ? await first(db, "SELECT * FROM storage_servers WHERE id=?", row.storage_server_id) : null;
+      if (server && row.storage_recording_id) {
+        await storageFetch(env, server, `api/recordings/${encodeURIComponent(String(row.storage_recording_id))}/review`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status, reviewed_by: user.username ?? null, reviewed_at: reviewedAt, notes })
+        });
+      }
+    } catch {}
+    await audit(request, env, user, `recording.review.${status}`, `${row.id}|${storedRecordingId(row)}`, Number(row.camera_id));
+    return json(recordingView(await first(db, "SELECT * FROM camera_recordings WHERE id=?", row.id)));
+  }
+  if (parts.length === 4 && parts[3] === "history" && method === "GET") {
+    const reviews = await all(db, "SELECT * FROM recording_review_history WHERE recording_id=? OR storage_recording_id=? ORDER BY created_at DESC LIMIT 200", row.id, row.storage_recording_id ?? "");
+    const auditRows = await all(db, "SELECT id,action,target,created_at,username FROM audit_logs WHERE action LIKE 'recording.%' AND (target=? OR target LIKE ?) ORDER BY created_at DESC LIMIT 200", String(row.id), `%${String(row.filename ?? "")}%`);
+    return json({
+      reviews: reviews.map(item => ({ ...item, id: Number(item.id) })),
+      audit: auditRows.map(item => ({ ...item, id: Number(item.id) }))
+    });
   }
   if (["file", "download"].includes(parts[3]) && method === "GET") {
     if (!row.storage_server_id || !row.storage_recording_id) return fail("Recording file is not available on configured storage", 404);
@@ -1382,6 +1492,9 @@ const normalizeRecording = (entry: any, defaults: any = {}) => {
     size_bytes: Number(raw.size_bytes ?? raw.size ?? raw.bytes ?? 0) || 0,
     created_at: createdRaw || (date ? `${date}T00:00:00.000Z` : null),
     duration_seconds: raw.duration_seconds ?? raw.duration ?? null,
+    review_status: storageText(raw.review_status, defaults.review_status) || "unreviewed",
+    reviewed_by: storageText(raw.reviewed_by, defaults.reviewed_by) || null,
+    reviewed_at: storageText(raw.reviewed_at, defaults.reviewed_at) || null,
     mime_type: storageText(raw.mime_type, raw.content_type) || "video/mp4"
   };
 };
@@ -1427,6 +1540,9 @@ const storageRecordingViews = async (db: any, env: Env): Promise<any[]> => {
           ended_at: null,
           duration_seconds: item.duration_seconds ?? null,
           size_bytes: Number(item.size_bytes ?? 0) || 0,
+          review_status: item.review_status ?? "unreviewed",
+          reviewed_by: item.reviewed_by ?? null,
+          reviewed_at: item.reviewed_at ?? null,
           kind: "continuous",
           status: "ready",
           storage_server_id: Number(server.id),
@@ -1531,6 +1647,38 @@ const storageServersRoute = async (request: Request, env: Env, parts: string[], 
       return new Response(response.body, { status: response.status, headers });
     } catch (error: any) {
       return fail(error?.message || "Could not stream recording", 502);
+    }
+  }
+
+  if (parts[4] === "recordings" && parts[5] && parts[6] === "review" && ["POST", "PATCH", "PUT"].includes(method)) {
+    const fileId = decodeURIComponent(parts[5]);
+    const data = await bodyOf(request);
+    try {
+      const response = await storageFetch(env, item, `api/recordings/${encodeURIComponent(fileId)}/review`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data)
+      });
+      const text = await response.text();
+      if (!response.ok) return fail(`Storage API returned HTTP ${response.status}: ${text.slice(0, 500)}`, 502);
+      return json(text ? JSON.parse(text) : { ok: true });
+    } catch (error: any) {
+      return fail(error?.message || "Could not save recording review", 502);
+    }
+  }
+
+  if (parts[4] === "recordings" && parts[5] && method === "DELETE") {
+    const fileId = decodeURIComponent(parts[5]);
+    try {
+      const response = await storageFetch(env, item, `api/recordings/${encodeURIComponent(fileId)}`, { method: "DELETE" });
+      if (!response.ok && response.status !== 404) {
+        const detail = await response.text().catch(() => "");
+        return fail(`Storage API returned HTTP ${response.status}: ${detail.slice(0, 500)}`, 502);
+      }
+      await audit(request, env, user, "storage.recording.deleted", fileId, null);
+      return empty();
+    } catch (error: any) {
+      return fail(error?.message || "Could not delete stored recording", 502);
     }
   }
 

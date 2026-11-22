@@ -18,7 +18,7 @@ const workerUrl = (process.env.WORKER_URL || "https://balasoftware.in").replace(
 const configInterval = Math.max(5000, Number(process.env.BRIDGE_CONFIG_INTERVAL_MS || 10000));
 const recordingRoot = process.env.STORAGE_ROOT || path.join(process.cwd(), "recordings");
 const hlsRoot = path.join(recordingRoot, "hls");
-const segmentSeconds = Math.max(30, Number(process.env.RECORDING_SEGMENT_SECONDS || 300));
+const segmentSeconds = Math.max(30, Number(process.env.RECORDING_SEGMENT_SECONDS || 3600));
 const localAiChatUrl = (process.env.LOCAL_AI_CHAT_URL || "http://127.0.0.1:8100").replace(/\/+$/, "");
 const localAiModelsUrl = (process.env.LOCAL_AI_MODELS_URL || "http://127.0.0.1:8200").replace(/\/+$/, "");
 
@@ -58,6 +58,13 @@ const redact = (text, source) => String(text || "").split(source).join("[redacte
 const newDate = () => new Date();
 const datePart = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 const timePart = (date) => `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
+const cameraFolder = (camera) => `Camera-${Number(camera.id)}`;
+const segmentWindow = (started) => {
+  const nextHour = new Date(started);
+  nextHour.setHours(nextHour.getHours() + 1, 0, 0, 0);
+  const untilHour = Math.floor((nextHour.getTime() - started.getTime()) / 1000);
+  return Math.max(30, Math.min(segmentSeconds, untilHour > 30 ? untilHour : segmentSeconds));
+};
 
 const getSession = (id, camera) => {
   let session = sessions.get(Number(id));
@@ -172,6 +179,7 @@ const uploadRecording = async (item) => {
   const bytes = await readFileSync(item.file);
   const form = new FormData();
   form.append("file", new Blob([bytes], { type: "video/mp4" }), item.metadata.filename);
+  form.append("camera_id", String(item.metadata.camera_id));
   form.append("camera", item.metadata.camera);
   form.append("date", item.metadata.date);
   form.append("time", item.metadata.time);
@@ -378,11 +386,11 @@ const refreshAiModels = async () => {
   aiState.models = models;
 };
 
-const recordChunk = async (session, source, file) => {
+const recordChunk = async (session, source, file, duration) => {
   const args = [
     "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp",
     "-fflags", "nobuffer", "-flags", "low_delay", "-analyzeduration", "1000000", "-probesize", "1000000",
-    "-i", source, "-t", String(segmentSeconds), "-an",
+    "-i", source, "-t", String(duration), "-an",
     "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-y", file
   ];
   const child = spawn(ffmpegPath, args, { stdio: ["pipe", "ignore", "pipe"] });
@@ -402,14 +410,16 @@ const recordLoop = async (session, generation) => {
     const started = newDate();
     const date = datePart(started);
     const time = timePart(started);
-    const filename = `${safeName(camera.name)}_${date}_${time.replace(/:/g, "-")}.mp4`;
-    const dir = path.join(recordingRoot, "recordings", safeName(camera.name), date);
+    const folder = cameraFolder(camera);
+    const duration = segmentWindow(started);
+    const filename = `${folder}_${date}_${time.replace(/:/g, "-")}.mp4`;
+    const dir = path.join(recordingRoot, "recordings", folder, date);
     mkdirSync(dir, { recursive: true });
     const file = path.join(dir, filename);
     const metadata = {
       camera_id: camera.id,
       name: safeName(camera.name),
-      camera: safeName(camera.name),
+      camera: folder,
       date,
       time,
       filename,
@@ -421,15 +431,15 @@ const recordLoop = async (session, generation) => {
     };
     try {
       await reportRecording(metadata).catch(() => null);
-      const result = await recordChunk(session, camera.source, file);
+      const result = await recordChunk(session, camera.source, file, duration);
       if (session.recordProcess) session.recordProcess = null;
       if (session.recordGeneration !== generation) {
         const size = existsSync(file) ? statSync(file).size : 0;
         if (size > 0) {
-          metadata.duration_seconds = Math.min(segmentSeconds, Math.max(1, Math.round((Date.now() - result.started) / 1000)));
+          metadata.duration_seconds = duration;
           metadata.size_bytes = size;
           metadata.status = "ready";
-          metadata.ended_at = new Date().toISOString();
+          metadata.ended_at = new Date(started.getTime() + duration * 1000).toISOString();
           session.lastRecordingAt = metadata.ended_at;
           await reportRecording(metadata).catch(() => null);
           await queueUpload(session, camera, file, metadata);
@@ -438,10 +448,9 @@ const recordLoop = async (session, generation) => {
       }
       const size = existsSync(file) ? statSync(file).size : 0;
       if (result.code === 0 && size > 0) {
-        const durationSeconds = Math.min(segmentSeconds, Math.max(1, Math.round((Date.now() - result.started) / 1000)));
-        metadata.duration_seconds = durationSeconds;
+        metadata.duration_seconds = duration;
         metadata.size_bytes = size;
-        metadata.ended_at = new Date().toISOString();
+        metadata.ended_at = new Date(started.getTime() + duration * 1000).toISOString();
         session.lastRecordingAt = metadata.ended_at;
         session.recordStatus = "recording";
         session.recordError = "";

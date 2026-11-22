@@ -64,6 +64,14 @@ if (!alertColumnText.includes("camera_id") || !aiTableText.includes("ai_settings
   console.log("Applying AI hardening migration...");
   run("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--file=cloudflare/migrations/0004_ai_hardening.sql"]);
 }
+const recordingColumns = capture("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--command", "PRAGMA table_info(camera_recordings);"]);
+const operationsTables = capture("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--command", "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('person_sessions','recording_review_history');"]);
+const recordingColumnText = `${recordingColumns.stdout || ""}${recordingColumns.stderr || ""}`;
+const operationsTableText = `${operationsTables.stdout || ""}${operationsTables.stderr || ""}`;
+if (!recordingColumnText.includes("review_status") || !operationsTableText.includes("person_sessions") || !operationsTableText.includes("recording_review_history")) {
+  console.log("Applying recording review and person session migration...");
+  run("npx", ["wrangler", "d1", "execute", databaseName, "--remote", "--file=cloudflare/migrations/0005_recording_review_person_sessions.sql"]);
+}
 
 const secrets = capture("npx", ["wrangler", "secret", "list", "--json"]);
 const secretText = `${secrets.stdout || ""}${secrets.stderr || ""}`;
