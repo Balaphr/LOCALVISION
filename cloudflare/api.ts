@@ -1548,7 +1548,10 @@ const bridgeCameraStatuses = async (env: Env) => {
     }
   }));
   for (const entry of entries) if (entry.status) statuses[entry.id] = entry.status;
-  if (Object.keys(statuses).length) info.status = "online";
+  if (Object.keys(statuses).length) {
+    info.status = "online";
+    info.error = null;
+  }
   return { statuses, info };
 };
 
