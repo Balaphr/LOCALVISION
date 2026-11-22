@@ -11,6 +11,7 @@ import { ZoneEditor } from "./pages/ZoneEditor";
 import { LivePage } from "./pages/LivePage";
 import { AIHub } from "./pages/AIHub";
 import { EventsPage } from "./pages/EventsPage";
+import { CameraStatusPage } from "./pages/CameraStatusPage";
 import { HeatmapPage } from "./pages/HeatmapPage";
 import { AlertsPage } from "./pages/AlertsPage";
 import { IntegrationsPage } from "./pages/IntegrationsPage";
@@ -120,6 +121,7 @@ export default function App() {
     : page === "recordings" ? <RecordingsPage cameras={cameras} />
     : page === "ai" ? <AIHub cameras={cameras} canWrite={canWrite} />
     : page === "events" ? <EventsPage cameras={cameras} />
+    : page === "camera-status" ? <CameraStatusPage cameras={cameras} />
     : page === "heatmap" ? <HeatmapPage cameras={cameras} />
     : page === "alerts" ? <AlertsPage canWrite={canWrite} />
     : page === "sharing" ? <SharingPage canWrite={canWrite} />

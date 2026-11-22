@@ -2699,6 +2699,73 @@ const heatmapRoute = async (request: Request, env: Env, url: URL, user: any): Pr
   });
 };
 
+const performanceRoute = async (request: Request, env: Env, url: URL, user: any): Promise<Response> => {
+  const ids = await accessibleCameraIds(env.DB, user);
+  const cameras = await all(env.DB, `SELECT * FROM cameras WHERE 1=1${cameraFilterSql(ids, [], "id", isAdmin(user))} ORDER BY id`, ...([] as any[]).concat(ids));
+  const statuses = await Promise.all(cameras.map(async (camera: any) => {
+    try {
+      const result = await cameraBridgeAction(env, camera, "/status");
+      const body: any = await result.json().catch(() => ({}));
+      return {
+        camera_id: camera.id,
+        name: camera.name,
+        host: camera.host,
+        protocol: camera.protocol,
+        enabled: Boolean(camera.enabled),
+        status: body.status ?? "unknown",
+        message: body.message ?? null,
+        resolution: body.resolution ?? null,
+        fps: body.fps ?? null,
+        bitrate_kbps: body.bitrate_kbps ?? null,
+        speed: body.speed ?? null,
+        last_frame_at: body.last_frame_at ?? null,
+        restarts: body.restarts ?? 0,
+        uptime_seconds: body.uptime_seconds ?? null,
+        recording: body.recording ?? null,
+        recording_error: body.recording_error ?? null,
+        last_recording_at: body.last_recording_at ?? null
+      };
+    } catch (error: any) {
+      return {
+        camera_id: camera.id,
+        name: camera.name,
+        host: camera.host,
+        protocol: camera.protocol,
+        enabled: Boolean(camera.enabled),
+        status: "offline",
+        message: error?.message || "Bridge unreachable",
+        resolution: null,
+        fps: null,
+        bitrate_kbps: null,
+        speed: null,
+        last_frame_at: null,
+        restarts: 0,
+        uptime_seconds: null,
+        recording: null,
+        recording_error: null,
+        last_recording_at: null
+      };
+    }
+  }));
+  let system: any = null;
+  try {
+    const result = await bridgeFetch(env, "/system");
+    system = await result.json().catch(() => null);
+  } catch {}
+  const totalBitrate = statuses.reduce((sum, item) => sum + (Number(item.bitrate_kbps) || 0), 0);
+  const totalFps = statuses.reduce((sum, item) => sum + (Number(item.fps) || 0), 0);
+  return json({
+    cameras: statuses,
+    system,
+    totals: {
+      cameras: statuses.length,
+      online: statuses.filter(item => ["online", "recording", "starting"].includes(String(item.status))).length,
+      bitrate_kbps: totalBitrate,
+      fps: totalFps
+    }
+  });
+};
+
 const alertsRoute = async (request: Request, env: Env, parts: string[], method: string, url: URL, user: any): Promise<Response> => {
   const ids = await accessibleCameraIds(env.DB, user);
   if (parts.length === 2 && method === "GET") {
@@ -2878,6 +2945,7 @@ const route = async (request: Request, env: Env): Promise<Response> => {
     return json(await eventsRoute(env, url, user, path === "/api/detections"));
   }
   if (parts[1] === "person-sessions") return personSessionsRoute(request, env, parts, method, url, user);
+  if (path === "/api/performance" && method === "GET") return performanceRoute(request, env, url, user);
   if (path === "/api/heatmaps" && method === "GET") return heatmapRoute(request, env, url, user);
 
   if (parts[1] === "alerts") return alertsRoute(request, env, parts, method, url, user);

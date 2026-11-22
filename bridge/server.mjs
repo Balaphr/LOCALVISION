@@ -2,8 +2,17 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync, statSync, existsSync, unlinkSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { timingSafeEqual } from "node:crypto";
 import ffmpegPath from "ffmpeg-static";
+let videoEncoder = "libx264";
+try {
+  const { execFileSync } = await import("node:child_process");
+  const encoders = execFileSync(ffmpegPath, ["-hide_banner", "-encoders"], { encoding: "utf8", timeout: 10000 });
+  if (/h264_nvenc/.test(encoders)) videoEncoder = "h264_nvenc";
+  else if (/h264_qsv/.test(encoders)) videoEncoder = "h264_qsv";
+  else if (/h264_vaapi/.test(encoders)) videoEncoder = "h264_vaapi";
+} catch {}
 
 try {
   for (const line of readFileSync(new URL("./.env", import.meta.url), "utf8").split(/\r?\n/)) {
@@ -78,6 +87,12 @@ const getSession = (id, camera) => {
       hlsRestarts: 0,
       hlsSource: "",
       hlsStarting: false,
+      hlsFps: null,
+      hlsBitrate: null,
+      hlsResolution: null,
+      hlsSpeed: null,
+      hlsStartedAt: null,
+      hlsLastStatsAt: null,
       recordDesired: false,
       recordProcess: null,
       recordStatus: "stopped",
@@ -112,22 +127,44 @@ const startHls = (session) => {
   session.hlsSource = camera.source;
   session.hlsError = "";
   session.hlsStatus = "starting";
+  session.hlsFps = null;
+  session.hlsBitrate = null;
+  session.hlsResolution = null;
+  session.hlsSpeed = null;
+  session.hlsStartedAt = new Date().toISOString();
+  session.hlsLastStatsAt = null;
   const dir = path.join(hlsRoot, String(session.id));
   mkdirSync(dir, { recursive: true });
   const playlist = path.join(dir, "index.m3u8");
+  const encoderArgs = videoEncoder === "libx264"
+    ? ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt", "yuv420p"]
+    : ["-c:v", videoEncoder, "-preset", "fast", "-pix_fmt", "yuv420p"];
   const args = [
-    "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp",
-    "-fflags", "nobuffer", "-flags", "low_delay", "-analyzeduration", "1000000", "-probesize", "1000000",
+    "-hide_banner", "-stats", "-loglevel", "error", "-rtsp_transport", "tcp",
+    "-thread_queue_size", "512", "-fflags", "nobuffer+genpts", "-flags", "low_delay",
+    "-analyzeduration", "500000", "-probesize", "500000",
     "-i", camera.source, "-an",
-    "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt", "yuv420p",
-    "-g", "20", "-keyint_min", "20", "-sc_threshold", "0",
-    "-f", "hls", "-hls_time", "2", "-hls_list_size", "6",
-    "-hls_flags", "delete_segments+append_list+independent_segments",
+    ...encoderArgs,
+    "-g", "30", "-keyint_min", "30", "-sc_threshold", "0",
+    "-f", "hls", "-hls_time", "1", "-hls_list_size", "4",
+    "-hls_flags", "delete_segments+append_list+independent_segments+omit_endlist",
     "-hls_segment_filename", path.join(dir, "seg-%06d.ts"), "-y", playlist
   ];
   const child = spawn(ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
   session.hlsProcess = child;
-  child.stderr.on("data", (chunk) => { session.hlsError = redact(`${session.hlsError}${chunk}`, camera.source); });
+  child.stderr.on("data", (chunk) => {
+    const text = String(chunk);
+    session.hlsError = redact(`${session.hlsError}${text}`, camera.source).slice(-1000);
+    const fpsMatch = text.match(/fps=\s*([\d.]+)/);
+    if (fpsMatch) session.hlsFps = Number(fpsMatch[1]);
+    const bitrateMatch = text.match(/bitrate=\s*([\d.]+)\s*kbits\/s/);
+    if (bitrateMatch) session.hlsBitrate = Number(bitrateMatch[1]);
+    const speedMatch = text.match(/speed=\s*([\d.]+)x/);
+    if (speedMatch) session.hlsSpeed = Number(speedMatch[1]);
+    const sizeMatch = text.match(/(\d{3,4})x(\d{3,4})/);
+    if (sizeMatch && !session.hlsResolution) session.hlsResolution = `${sizeMatch[1]}x${sizeMatch[2]}`;
+    session.hlsLastStatsAt = new Date().toISOString();
+  });
   child.once("spawn", () => {
     session.hlsStarting = false;
     session.hlsStatus = "online";
@@ -649,10 +686,13 @@ const hlsStatus = (session) => {
     camera_id: session.id,
     status: session.hlsStatus === "online" ? (lastFrameAt ? "online" : "starting") : session.hlsStatus,
     message: session.hlsError || configError || null,
-    resolution: null,
-    fps: null,
-    last_frame_at: lastFrameAt,
+    resolution: session.hlsResolution,
+    fps: session.hlsFps,
+    bitrate_kbps: session.hlsBitrate,
+    speed: session.hlsSpeed,
+    last_frame_at: lastFrameAt || session.hlsLastStatsAt,
     restarts: session.hlsRestarts,
+    uptime_seconds: session.hlsStartedAt ? Math.max(0, (Date.now() - new Date(session.hlsStartedAt).getTime()) / 1000) : null,
     recording: session.recordStatus,
     recording_error: session.recordError || queueErrors[0] || null,
     last_recording_at: session.lastRecordingAt
@@ -696,6 +736,34 @@ const hlsSegment = (response, session, segment) => {
   response.end(readFileSync(file));
 };
 
+const systemMetrics = () => {
+  const totalMem = os.totalmem();
+  const freeMem = os.freemem();
+  let rx = 0, tx = 0;
+  if (process.platform === "linux") {
+    try {
+      const dev = readFileSync("/proc/net/dev", "utf8");
+      for (const line of dev.split("\n").slice(2)) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 10 || !parts[0].endsWith(":")) continue;
+        rx += Number(parts[1]) || 0;
+        tx += Number(parts[9]) || 0;
+      }
+    } catch {}
+  }
+  return {
+    platform: process.platform,
+    cpu_count: os.cpus().length,
+    load_average: os.loadavg(),
+    memory_total_bytes: totalMem,
+    memory_free_bytes: freeMem,
+    memory_used_bytes: totalMem - freeMem,
+    network_rx_bytes: rx,
+    network_tx_bytes: tx,
+    uptime_seconds: os.uptime()
+  };
+};
+
 http.createServer(async (request, response) => {
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
   const pathname = url.pathname;
@@ -706,6 +774,11 @@ http.createServer(async (request, response) => {
   }
   if (!authorized(request)) {
     sendJson(response, 401, { detail: "Invalid bridge token" });
+    return;
+  }
+
+  if (pathname === "/system" && request.method === "GET") {
+    sendJson(response, 200, systemMetrics());
     return;
   }
 

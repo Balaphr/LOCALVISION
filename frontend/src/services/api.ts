@@ -100,6 +100,7 @@ export const operationsApi = {
   aiSettings: (cameraId?: number) => request<AiSettingsResponse>(`/api/ai/settings?${queryString({ camera_id: cameraId })}`),
   saveAiSettings: (settings: Partial<AiSettings>, cameraId?: number) => request<AiSettingsResponse>(`/api/ai/settings?${queryString({ camera_id: cameraId })}`, { method: "POST", body: JSON.stringify({ settings }) }),
   aiSnapshotUrl: (cameraId: number, path: string) => `/api/ai/snapshot?camera_id=${cameraId}&path=${encodeURIComponent(path)}`,
+  performance: () => request<any>("/api/performance"),
   surveillance: () => request<AiStatus>("/api/surveillance/status"),
   surveillanceControl: (action: "start" | "stop", cameraId?: number) => request<AiStatus>(`/api/surveillance/${action}`, { method: "POST", body: JSON.stringify({ camera_id: cameraId }) })
 };
