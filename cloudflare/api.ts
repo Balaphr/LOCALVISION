@@ -1552,6 +1552,58 @@ const bridgeCameraStatuses = async (env: Env) => {
   return { statuses, info };
 };
 
+const systemHealthFrom = (bridge: any, storages: Array<{ row: any; probe: any }>) => {
+  const cameraStatuses = Object.values(bridge?.statuses ?? {}) as any[];
+  const bridgeOnline = bridge?.info?.status === "online";
+  const recordingCameras = cameraStatuses.filter((item: any) => String(item?.recording ?? "").toLowerCase() === "recording").length;
+  const streamingCameras = cameraStatuses.filter((item: any) => ["online", "recording", "starting"].includes(String(item?.status ?? "").toLowerCase())).length;
+  const totals = { total_bytes: 0, used_bytes: 0, free_bytes: 0 };
+  for (const { probe } of storages) {
+    if (!probe?.usage) continue;
+    totals.total_bytes += Number(probe.usage.total_bytes) || 0;
+    totals.used_bytes += Number(probe.usage.used_bytes) || 0;
+    totals.free_bytes += Number(probe.usage.available_bytes) || 0;
+  }
+  const connected = storages.find((item: any) => ["online", "warning"].includes(String(item?.probe?.status ?? "")));
+  const storageDetail = connected
+    ? `Connected to ${connected.row.name}`
+    : storages.find((item: any) => item?.probe?.message)?.probe.message || "No storage integration is connected";
+  return {
+    api: "ok",
+    media: bridgeOnline ? "ok" : "unavailable",
+    recording: bridgeOnline ? "ok" : "unavailable",
+    ai: "not_configured",
+    cpu: null,
+    ram: null,
+    gpu: null,
+    network: bridgeOnline ? "ok" : "unavailable",
+    host: "cloudflare",
+    storage: {
+      ...totals,
+      low: totals.total_bytes > 0 && totals.free_bytes / totals.total_bytes < 0.15
+    },
+    details: {
+      api: "Edge API responding",
+      media: bridgeOnline
+        ? `Media bridge online · ${cameraStatuses.length} camera(s) reporting`
+        : bridge?.info?.config_error || bridge?.info?.error || "Media bridge is unreachable",
+      recording: bridgeOnline
+        ? recordingCameras ? `${recordingCameras} camera(s) recording` : `Bridge online · ${streamingCameras} camera(s) streaming`
+        : "Media bridge offline; recording state cannot be verified",
+      ai: "No local AI worker is connected in this edge-only deployment",
+      storage: storageDetail,
+      host: "Cloudflare Workers do not expose host CPU/RAM counters"
+    }
+  };
+};
+
+const probeStorageServers = async (env: Env, rows: any[]) => Promise.all(rows.map(async (row: any) => ({
+  row,
+  probe: row.enabled
+    ? await probeStorage(env, row)
+    : { status: "disabled", message: "Integration disabled", usage: null, cameras: [], checked_at: null }
+})));
+
 const monitoringActivityView = (row: any) => ({
   id: row.id,
   user_id: row.user_id ?? null,
@@ -1594,7 +1646,11 @@ const monitoringOverview = async (env: Env, url: URL, actor: any): Promise<Respo
     all(env.DB, "SELECT * FROM camera_recordings ORDER BY started_at DESC LIMIT 500"),
     all(env.DB, "SELECT * FROM storage_servers ORDER BY id")
   ]);
-  const bridge = await bridgeCameraStatuses(env);
+  const [bridge, storageProbes] = await Promise.all([
+    bridgeCameraStatuses(env),
+    probeStorageServers(env, storageRows)
+  ]);
+  const health = systemHealthFrom(bridge, storageProbes);
   const ownerById = new Map(userRows.map((row: any) => [Number(row.id), row]));
   const activeById = new Map(activeSessions.map((row: any) => [String(row.id), row]));
   const recordingsByCamera = new Map<number, any[]>();
@@ -1704,6 +1760,7 @@ const monitoringOverview = async (env: Env, url: URL, actor: any): Promise<Respo
     generated_at: stamp(),
     filters,
     summary,
+    health,
     bridge: bridge.info,
     storage: {
       recorded_bytes: recordedBytes,
@@ -1899,18 +1956,12 @@ const route = async (request: Request, env: Env): Promise<Response> => {
     });
   }
   if (path === "/api/metrics" && method === "GET") {
-    return json({
-      api: "ok",
-      media: "unavailable",
-      recording: "unavailable",
-      ai: "unavailable",
-      cpu: null,
-      ram: null,
-      gpu: null,
-      network: "unavailable",
-      host: "cloudflare",
-      storage: { total_bytes: 0, used_bytes: 0, free_bytes: 0, low: false }
-    });
+    const [bridge, storageRows] = await Promise.all([
+      bridgeCameraStatuses(env),
+      all(env.DB, "SELECT * FROM storage_servers WHERE enabled=1 ORDER BY id")
+    ]);
+    const storageProbes = await Promise.all(storageRows.map(async (row: any) => ({ row, probe: await probeStorage(env, row) })));
+    return json(systemHealthFrom(bridge, storageProbes));
   }
   if (path === "/api/ai" && method === "GET") {
     return json({

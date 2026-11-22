@@ -27,6 +27,7 @@ export interface Metrics {
   network?: string | null;
   host: string;
   storage: { total_bytes: number; used_bytes: number; free_bytes: number; low?: boolean };
+  details?: Partial<Record<"api" | "media" | "recording" | "ai" | "storage" | "host", string>>;
 }
 
 export interface Integration {

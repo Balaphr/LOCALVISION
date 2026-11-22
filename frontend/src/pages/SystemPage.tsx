@@ -39,6 +39,13 @@ const statusClass = (value?: string | null) => {
 
 const healthy = (value?: string | null) => ["ok", "running", "ready", "local-hybrid", "local-hog", "ultralytics-yolo", "online"].includes(value ?? "");
 
+const healthState = (value?: string | null, detail?: string | null) => {
+  const state = String(value ?? "").toLowerCase();
+  if (healthy(state)) return { label: "Operational", className: "healthy" };
+  if (state === "not_configured" || /not configured|no local ai/i.test(detail ?? "")) return { label: "Not configured", className: "neutral" };
+  return { label: "Unavailable", className: "neutral" };
+};
+
 export function SystemPage({ role }: Props) {
   const [overview, setOverview] = useState<MonitoringOverview | null>(null);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
@@ -57,12 +64,9 @@ export function SystemPage({ role }: Props) {
     busy.current = true;
     if (!loaded.current) setLoading(true);
     try {
-      const [nextOverview, nextMetrics] = await Promise.all([
-        adminMonitoringApi.overview(filters),
-        monitoringApi.metrics().catch(() => null)
-      ]);
+      const nextOverview = await adminMonitoringApi.overview(filters);
       setOverview(nextOverview);
-      setMetrics(nextMetrics);
+      setMetrics(nextOverview.health ?? await monitoringApi.metrics().catch(() => null));
       setError("");
       loaded.current = true;
     } catch (reason) {
@@ -101,7 +105,14 @@ export function SystemPage({ role }: Props) {
   }
 
   const summary = overview?.summary;
-  const storagePercent = metrics?.storage.total_bytes ? Math.round(metrics.storage.used_bytes / metrics.storage.total_bytes * 100) : 0;
+  const storageTotal = metrics?.storage.total_bytes ?? 0;
+  const storagePercent = storageTotal > 0 ? Math.min(100, Math.round((metrics?.storage.used_bytes ?? 0) / storageTotal * 100)) : 0;
+  const healthCards: Array<[string, string | null | undefined, string | undefined]> = [
+    ["API", metrics?.api, metrics?.details?.api],
+    ["Media", metrics?.media, metrics?.details?.media],
+    ["Recording", metrics?.recording, metrics?.details?.recording],
+    ["AI", metrics?.ai, metrics?.details?.ai]
+  ];
   const summaryCards = [
     ["Accounts", String(summary?.accounts ?? "—"), `${summary?.online_users ?? 0} online`],
     ["Active sessions", String(summary?.active_sessions ?? "—"), "seen in the last 5 minutes"],
@@ -124,10 +135,13 @@ export function SystemPage({ role }: Props) {
       {summaryCards.map(([label, value, detail]) => <div key={label}><small>{label}</small><b>{value}</b><span>{detail}</span></div>)}
     </div>
     <div className="system-grid">
-      {[["API", metrics?.api], ["Media", metrics?.media], ["Recording", metrics?.recording], ["AI", metrics?.ai]].map(([label, value]) => <div className="health-card" key={label}><small>{label}</small><b>{value ?? "—"}</b><span className={healthy(value) ? "healthy" : "neutral"}>{healthy(value) ? "Operational" : "Unavailable"}</span></div>)}
-      <div className="health-card wide"><small>Storage volume</small><b>{storagePercent}% used</b><div className="storage-meter"><i style={{ width: `${storagePercent}%` }} /></div><span>{metrics ? `${formatBytes(metrics.storage.free_bytes)} free` : "Awaiting metrics"}</span></div>
-      <div className="health-card"><small>CPU</small><b>{metrics?.cpu == null ? "—" : `${metrics.cpu}%`}</b><span>Host resource</span></div>
-      <div className="health-card"><small>RAM</small><b>{metrics?.ram == null ? "—" : `${metrics.ram}%`}</b><span>Host resource</span></div>
+      {healthCards.map(([label, value, detail]) => {
+        const state = healthState(value, detail);
+        return <div className="health-card" key={label}><small>{label}</small><b>{value === "not_configured" ? "not configured" : value ?? "—"}</b><span className={state.className}>{state.label}</span>{detail && <small className="health-detail">{detail}</small>}</div>;
+      })}
+      <div className="health-card wide"><small>Storage volume</small><b>{storageTotal > 0 ? `${storagePercent}% used` : "No capacity data"}</b><div className="storage-meter"><i style={{ width: `${storagePercent}%` }} /></div><span>{storageTotal > 0 ? `${formatBytes(metrics?.storage.free_bytes)} free` : metrics?.details?.storage || "Awaiting storage API"}</span>{storageTotal > 0 && metrics?.details?.storage && <small className="health-detail">{metrics.details.storage}</small>}</div>
+      <div className="health-card"><small>CPU</small><b>{metrics?.cpu == null ? "Not exposed" : `${metrics.cpu}%`}</b><span>{metrics?.host === "cloudflare" ? "Serverless edge" : "Host resource"}</span>{metrics?.details?.host && <small className="health-detail">{metrics.details.host}</small>}</div>
+      <div className="health-card"><small>RAM</small><b>{metrics?.ram == null ? "Not exposed" : `${metrics.ram}%`}</b><span>{metrics?.host === "cloudflare" ? "Serverless edge" : "Host resource"}</span></div>
     </div>
     <section className="settings-panel monitor-panel">
       <div className="section-title"><h2>Storage services</h2><span>{overview?.storage.servers.length ?? 0} configured integrations</span></div>

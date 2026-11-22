@@ -1,3 +1,4 @@
+import type { Metrics } from "./operations";
 import type { Recording } from "./recording";
 
 export interface MonitoringFilters {
@@ -111,6 +112,7 @@ export interface MonitoringOverview {
   generated_at: string;
   filters: MonitoringFilters;
   summary: MonitoringSummary;
+  health: Metrics;
   bridge: MonitoringBridge;
   storage: { recorded_bytes: number; servers: MonitoringStorageServer[] };
   users: MonitoringUser[];
