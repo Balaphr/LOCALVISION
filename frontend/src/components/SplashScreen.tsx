@@ -1,9 +1,40 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+
 interface Props { onComplete: () => void; }
 
+const SPLASH_DURATION = 1900;
+const EXIT_DURATION = 460;
 const irisBlades = [0, 60, 120, 180, 240, 300];
 
 export function SplashScreen({ onComplete }: Props) {
-  return <main className="splash-screen" role="status" aria-label="Loading LocalVision AI">
+  const [leaving, setLeaving] = useState(false);
+  const completed = useRef(false);
+  const exitTimer = useRef<number | null>(null);
+  const onCompleteRef = useRef(onComplete);
+
+  useEffect(() => { onCompleteRef.current = onComplete; }, [onComplete]);
+
+  const finish = useCallback(() => {
+    if (completed.current) return;
+    completed.current = true;
+    setLeaving(true);
+    exitTimer.current = window.setTimeout(() => onCompleteRef.current(), EXIT_DURATION);
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(finish, SPLASH_DURATION);
+    return () => {
+      window.clearTimeout(timer);
+      if (exitTimer.current !== null) window.clearTimeout(exitTimer.current);
+    };
+  }, [finish]);
+
+  return <main className={`splash-screen${leaving ? " splash-leaving" : ""}`} role="status" aria-label="Loading LocalVision AI">
+    <div className="splash-backdrop" aria-hidden="true">
+      <span className="splash-orbit splash-orbit-one" />
+      <span className="splash-orbit splash-orbit-two" />
+      <span className="splash-sweep" />
+    </div>
     <div className="splash-center">
       <div className="splash-stage" aria-hidden="true">
         <span className="splash-focus focus-tl" />
@@ -45,7 +76,7 @@ export function SplashScreen({ onComplete }: Props) {
       </div>
       <div className="splash-copy"><span className="eyebrow">LocalVision neural core</span><strong>FOCUS LOCKED</strong><small>Initializing secure AI vision</small></div>
     </div>
-    <button className="splash-continue" onClick={onComplete}>Continue</button>
-    <div className="splash-timer" onAnimationEnd={onComplete} />
+    <button className="splash-continue" onClick={finish}>Continue</button>
+    <div className="splash-timer" />
   </main>;
 }
