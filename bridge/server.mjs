@@ -163,21 +163,30 @@ const uploadRecording = async (item) => {
   const headers = new Headers();
   applyStorageAuth(headers, storageConfig);
   const target = `${storageConfig.endpoint.replace(/\/+$/, "")}/api/storage/upload`;
-  let response = await fetch(target, { method: "POST", headers, body: form, redirect: "manual", signal: AbortSignal.timeout(120000) });
-  if ([301, 302, 303, 307, 308].includes(response.status)) {
+  const original = new URL(target);
+  let current = target;
+  let response;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    response = await fetch(current, { method: "POST", headers, body: form, redirect: "manual", signal: AbortSignal.timeout(120000) });
+    if (![301, 302, 303, 307, 308].includes(response.status)) break;
     const location = response.headers.get("location");
     if (!location) throw new Error(`Storage upload redirected without a target (${response.status})`);
-    response = await fetch(new URL(location, target).toString(), { method: "POST", headers, body: form, signal: AbortSignal.timeout(120000) });
+    const redirected = new URL(location, current);
+    if (redirected.origin !== original.origin) throw new Error("Storage upload redirect must stay on the same origin");
+    current = redirected.toString();
   }
-  if (!response.ok) throw new Error(`Storage upload failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
-  const saved = await response.json();
-  await reportRecording({
-    ...item.metadata,
-    storage_server_id: storageConfig.id,
-    storage_recording_id: saved.id || item.metadata.storage_recording_id,
-    status: "ready"
-  });
-  unlinkSync(item.file);
+  if (response.ok || response.status === 409) {
+    const saved = await response.json().catch(() => ({}));
+    await reportRecording({
+      ...item.metadata,
+      storage_server_id: storageConfig.id,
+      storage_recording_id: saved.id || item.metadata.storage_recording_id,
+      status: "ready"
+    });
+    unlinkSync(item.file);
+    return;
+  }
+  throw new Error(`Storage upload failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
 };
 
 const drainUploadQueue = async () => {
@@ -198,7 +207,7 @@ const drainUploadQueue = async () => {
 };
 
 const queueUpload = async (session, camera, file, metadata) => {
-  uploadQueue.set(file, { file, metadata, sessionId: session.id, cameraId: camera.id });
+  if (!uploadQueue.has(file)) uploadQueue.set(file, { file, metadata, sessionId: session.id, cameraId: camera.id });
   await drainUploadQueue();
 };
 
@@ -207,7 +216,7 @@ const recordChunk = async (session, source, file) => {
     "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp",
     "-fflags", "nobuffer", "-flags", "low_delay", "-analyzeduration", "1000000", "-probesize", "1000000",
     "-i", source, "-t", String(segmentSeconds), "-an",
-    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y", file
+    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-y", file
   ];
   const child = spawn(ffmpegPath, args, { stdio: ["pipe", "ignore", "pipe"] });
   session.recordProcess = child;
@@ -248,7 +257,16 @@ const recordLoop = async (session, generation) => {
       const result = await recordChunk(session, camera.source, file);
       if (session.recordProcess) session.recordProcess = null;
       if (session.recordGeneration !== generation) {
-        if (existsSync(file)) unlinkSync(file);
+        const size = existsSync(file) ? statSync(file).size : 0;
+        if (size > 0) {
+          metadata.duration_seconds = Math.min(segmentSeconds, Math.max(1, Math.round((Date.now() - result.started) / 1000)));
+          metadata.size_bytes = size;
+          metadata.status = "ready";
+          metadata.ended_at = new Date().toISOString();
+          session.lastRecordingAt = metadata.ended_at;
+          await reportRecording(metadata).catch(() => null);
+          await queueUpload(session, camera, file, metadata);
+        }
         return;
       }
       const size = existsSync(file) ? statSync(file).size : 0;
@@ -425,15 +443,25 @@ const hlsStatus = (session) => {
 
 const hlsPlaylist = async (response, session) => {
   const file = path.join(hlsRoot, String(session.id), "index.m3u8");
-  for (let attempt = 0; attempt < 40 && (!existsSync(file) || statSync(file).size === 0); attempt += 1) {
+  let playlist = null;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    if (existsSync(file) && statSync(file).size > 0) {
+      const lines = readFileSync(file, "utf8").split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+      if (lines.some(line => line.endsWith(".ts"))) {
+        const header = lines.filter(line => line === "#EXTM3U");
+        const body = lines.filter(line => line !== "#EXTM3U");
+        playlist = Buffer.from([...(header.length ? header : ["#EXTM3U"]), ...body].join("\n") + "\n");
+        break;
+      }
+    }
     await new Promise(resolve => setTimeout(resolve, 250));
   }
-  if (!existsSync(file)) {
+  if (!playlist) {
     sendJson(response, 503, { detail: "Live stream is starting or unavailable" });
     return;
   }
   response.writeHead(200, { "content-type": "application/vnd.apple.mpegurl", "cache-control": "no-store" });
-  response.end(readFileSync(file));
+  response.end(playlist);
 };
 
 const hlsSegment = (response, session, segment) => {
