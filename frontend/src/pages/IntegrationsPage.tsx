@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { Integration, IntegrationInput } from "../types/operations";
-import { integrationApi } from "../services/api";
+import type { StorageIntegration } from "../types/storage";
+import { integrationApi, storageApi } from "../services/api";
 
 interface Props { canWrite: boolean; }
 
@@ -8,6 +9,7 @@ const empty: IntegrationInput = { name: "", kind: "webhook", endpoint: "", auth_
 
 export function IntegrationsPage({ canWrite }: Props) {
   const [items, setItems] = useState<Integration[]>([]);
+  const [storageServers, setStorageServers] = useState<StorageIntegration[]>([]);
   const [form, setForm] = useState<IntegrationInput>(empty);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -18,9 +20,18 @@ export function IntegrationsPage({ canWrite }: Props) {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not load integrations");
     }
+    try {
+      setStorageServers(await storageApi.list());
+    } catch {
+      setStorageServers([]);
+    }
   };
 
   useEffect(() => { void load(); }, []);
+
+  const connectedStorage = storageServers.filter(server => server.enabled && ["online", "warning"].includes(server.last_status));
+  const storageLabel = !storageServers.length ? "Not configured" : connectedStorage.length ? "Active" : "Inactive";
+  const storageClass = connectedStorage.some(server => server.last_status === "online") ? "status-online" : connectedStorage.length ? "status-warning" : "status-offline";
 
   const update = (key: keyof IntegrationInput, value: string | boolean) => {
     setForm(current => ({ ...current, [key]: value }));
@@ -73,7 +84,7 @@ export function IntegrationsPage({ canWrite }: Props) {
   };
 
   return <>
-    <div className="page-heading"><div><span className="eyebrow">System / integrations</span><h1>API integrations</h1><p>Optional notification destinations with encrypted credentials.</p></div></div>
+    <div className="page-heading"><div><span className="eyebrow">System / integrations</span><h1>API integrations</h1><p>Storage connection status and optional notification destinations.</p></div></div>
     {notice && <div className="notice inline-notice" role="status">{notice}</div>}
     {error && <div className="error-state" role="alert">{error}</div>}
     {canWrite && <section className="settings-panel">
@@ -89,6 +100,15 @@ export function IntegrationsPage({ canWrite }: Props) {
       </form>
     </section>}
     <div className="integration-grid">
+      <article className="integration-card" key="storage">
+        <div className="integration-icon">▥</div>
+        <div>
+          <h3>Storage</h3>
+          <p>Ubuntu storage · remote API</p>
+          <small>{storageServers.length ? `${storageServers.map(server => server.name).join(", ")} · ${storageServers.length} server${storageServers.length === 1 ? "" : "s"}` : "No storage server configured"}</small>
+        </div>
+        <div className="integration-actions"><span className={`storage-status ${storageClass}`}>{storageLabel}</span></div>
+      </article>
       {items.map(item => <article className="integration-card" key={item.id}>
         <div className="integration-icon">↗</div>
         <div><h3>{item.name}</h3><p>{item.kind} · {item.auth_method}</p><small>{item.enabled ? "Enabled" : "Disabled"} · secrets never displayed</small></div>

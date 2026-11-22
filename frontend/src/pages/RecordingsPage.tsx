@@ -3,6 +3,21 @@ import type { Camera } from "../types/camera";
 import type { Recording } from "../types/recording";
 import { recordingApi } from "../services/api";
 
+const statusTone = (status: string) => {
+  const value = status.toLowerCase();
+  if (["ready", "completed", "complete", "saved", "available", "success"].includes(value)) return "ready";
+  if (["active", "recording", "in_progress", "in-progress", "running"].includes(value)) return "active";
+  if (["failed", "error", "missing", "warning", "offline", "invalid"].includes(value)) return "attention";
+  return "other";
+};
+
+const statusGroups = [
+  { key: "ready", label: "Ready" },
+  { key: "active", label: "Active" },
+  { key: "attention", label: "Needs attention" },
+  { key: "other", label: "Other" }
+] as const;
+
 export function RecordingsPage({ cameras }: { cameras: Camera[] }) {
   const [items, setItems] = useState<Recording[]>([]);
   const [cameraId, setCameraId] = useState("");
@@ -30,6 +45,15 @@ export function RecordingsPage({ cameras }: { cameras: Camera[] }) {
   useEffect(() => { void load(); }, [cameraId, date]);
   useEffect(() => { if (video.current) video.current.playbackRate = speed; }, [speed, selected]);
 
+  const statusCounts = items.reduce<Record<string, number>>((counts, item) => {
+    const status = item.status || "unknown";
+    counts[status] = (counts[status] ?? 0) + 1;
+    return counts;
+  }, {});
+  const statusEntries = Object.entries(statusCounts).sort(([left], [right]) => left.localeCompare(right));
+  const groupedStatuses = statusGroups.map(group => ({ ...group, count: items.filter(item => statusTone(item.status || "unknown") === group.key).length }));
+  const cameraCount = new Set(items.map(item => item.camera_id)).size;
+
   return <>
     <div className="page-heading"><div><span className="eyebrow">Evidence browser</span><h1>Recordings</h1><p>Review saved camera segments from configured Ubuntu storage.</p></div></div>
     <div className="recording-toolbar">
@@ -37,6 +61,17 @@ export function RecordingsPage({ cameras }: { cameras: Camera[] }) {
       <input type="date" value={date} onChange={event => setDate(event.target.value)} />
       <button onClick={() => void load()}>Refresh</button>
     </div>
+    <section className="recording-status-bar" aria-label="Recording status summary">
+      <div className="recording-status-head"><span>Recording status</span><b>{items.length} total · {cameraCount} camera{cameraCount === 1 ? "" : "s"}</b></div>
+      <div className="recording-status-track">
+        {groupedStatuses.filter(group => group.count > 0).map(group => <i key={group.key} className={group.key} style={{ width: `${group.count / items.length * 100}%` }} title={`${group.label}: ${group.count}`} />)}
+        {!items.length && <i className="empty" />}
+      </div>
+      <div className="recording-status-footer">
+        <div className="recording-status-legend">{groupedStatuses.map(group => <span key={group.key} className={group.key}><i />{group.label} {group.count}</span>)}</div>
+        <div className="recording-status-tags">{statusEntries.length ? statusEntries.map(([status, count]) => <span key={status} className={statusTone(status)}>{status}: {count}</span>) : <span>no status data</span>}</div>
+      </div>
+    </section>
     {error && <div className="error-state">{error}</div>}
     <div className="recording-layout">
       <section className="panel recording-list">
