@@ -804,14 +804,29 @@ const recordingsRoute = async (request: Request, env: Env, parts: string[], meth
     const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));
     const pageSize = Math.max(1, Number(url.searchParams.get("page_size") ?? 50));
     const params: any[] = [];
-    let sql = "SELECT * FROM camera_recordings WHERE 1=1";
     const cameraId = Number(url.searchParams.get("camera_id"));
-    if (Number.isFinite(cameraId) && cameraId > 0) { sql += " AND camera_id=?"; params.push(cameraId); }
+    const cameraFilter = Number.isFinite(cameraId) && cameraId > 0 ? cameraId : null;
     const date = String(url.searchParams.get("date") ?? "").trim();
+    let sql = "SELECT * FROM camera_recordings WHERE 1=1";
+    if (cameraFilter) { sql += " AND camera_id=?"; params.push(cameraFilter); }
     if (date) { sql += " AND date=?"; params.push(date); }
-    sql += " ORDER BY started_at DESC LIMIT ? OFFSET ?";
-    params.push(pageSize, (page - 1) * pageSize);
-    return json({ items: (await all(db, sql, ...params)).map(recordingView), page, page_size: pageSize });
+    sql += " ORDER BY started_at DESC";
+    const rows = await all(db, sql, ...params);
+    const storageViews = await storageRecordingViews(db, env);
+    const keyFor = (item: any) => `${cameraKey(item.camera || item.camera_id)}|${item.date ?? ""}|${item.filename ?? ""}`;
+    const merged = new Map<string, any>();
+    for (const item of storageViews) merged.set(keyFor(item), item);
+    for (const row of rows) {
+      const view = recordingView(row);
+      const key = keyFor(view);
+      const existing = merged.get(key);
+      merged.set(key, existing ? { ...existing, ...view, fileUrl: view.fileUrl || existing.fileUrl, downloadUrl: view.downloadUrl || existing.downloadUrl } : view);
+    }
+    const items = [...merged.values()]
+      .filter(item => (!cameraFilter || item.camera_id === cameraFilter) && (!date || item.date === date))
+      .sort((left, right) => String(right.started_at ?? right.date ?? "").localeCompare(String(left.started_at ?? left.date ?? "")))
+      .slice((page - 1) * pageSize, page * pageSize);
+    return json({ items, page, page_size: pageSize });
   }
   const id = Number(parts[2]);
   if (!Number.isFinite(id)) return fail("Recording not found", 404);
@@ -1270,6 +1285,47 @@ const storageRecordings = (payload: any): any[] => {
   }
   const defaults = Array.isArray(payload) ? {} : payload ?? {};
   return items.map((item: any) => normalizeRecording(item, defaults)).filter((item: any) => item.id);
+};
+
+const cameraKey = (value: any) => String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+
+const storageRecordingViews = async (db: any, env: Env): Promise<any[]> => {
+  const servers = await all(db, "SELECT * FROM storage_servers WHERE enabled=1 ORDER BY id");
+  const cameraRows = await all(db, "SELECT id,name,host FROM cameras");
+  const views: any[] = [];
+  for (const server of servers) {
+    try {
+      const response = await storageFetch(env, server, "api/recordings");
+      if (!response.ok) continue;
+      const payload: any = await response.json().catch(() => ({}));
+      for (const item of storageRecordings(payload)) {
+        const key = cameraKey(item.camera);
+        const matched = cameraRows.find((row: any) => cameraKey(row.name) === key || cameraKey(row.host) === key || cameraKey(`${row.name} ${row.host}`) === key);
+        const startedAt = item.created_at || (item.date ? `${item.date}T${String(item.time ?? "00:00:00")}` : new Date().toISOString());
+        views.push({
+          id: -(views.length + 1),
+          camera_id: Number(item.camera_id) > 0 ? Number(item.camera_id) : matched ? Number(matched.id) : null,
+          camera: item.camera,
+          name: item.name || item.filename,
+          date: item.date,
+          time: item.time ?? String(startedAt).slice(11, 19),
+          path: item.path,
+          filename: item.filename,
+          started_at: startedAt,
+          ended_at: null,
+          duration_seconds: item.duration_seconds ?? null,
+          size_bytes: Number(item.size_bytes ?? 0) || 0,
+          kind: "continuous",
+          status: "ready",
+          storage_server_id: Number(server.id),
+          storage_recording_id: String(item.id),
+          fileUrl: `/api/storage/servers/${Number(server.id)}/recordings/${encodeURIComponent(String(item.id))}/file`,
+          downloadUrl: `/api/storage/servers/${Number(server.id)}/recordings/${encodeURIComponent(String(item.id))}/download`
+        });
+      }
+    } catch {}
+  }
+  return views;
 };
 
 const storageServersRoute = async (request: Request, env: Env, parts: string[], method: string, user: any): Promise<Response> => {
