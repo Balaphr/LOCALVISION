@@ -45,6 +45,9 @@ export interface StorageRecording {
   created_at: string | null;
   duration_seconds: number | null;
   mime_type: string;
+  review_status?: string;
+  reviewed_by?: string | null;
+  reviewed_at?: string | null;
   server_id: number;
   server_name: string;
   fileUrl: string;

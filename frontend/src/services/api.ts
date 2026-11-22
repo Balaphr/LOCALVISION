@@ -1,5 +1,5 @@
 import type { Camera, CameraInput, CameraStatus } from "../types/camera";
-import type { RecordingPage, Zone, ZoneInput } from "../types/recording";
+import type { Recording, RecordingPage, Zone, ZoneInput } from "../types/recording";
 import type { AiChatResponse, AiModel, AiSettings, AiSettingsResponse, AiStatus, AlertItem, DiscoveryResult, EventItem, Integration, IntegrationInput, Metrics, SharingHistoryItem } from "../types/operations";
 import type { LoginResponse, Role, Share, User, UserRecord } from "../types/auth";
 import type { StorageIntegration, StorageIntegrationInput, StorageOverview, StorageProbe, StorageRecording } from "../types/storage";
@@ -56,7 +56,9 @@ export const cameraApi = {
 export const recordingApi = {
   list: (filters: { camera_id?: number; date?: string }) => request<RecordingPage>(`/api/recordings?${queryString(filters)}`),
   fileUrl: (id: number) => `/api/recordings/${id}/file`,
-  remove: (id: number) => request<void>(`/api/recordings/${id}`, { method: "DELETE" })
+  remove: (id: number) => request<void>(`/api/recordings/${id}`, { method: "DELETE" }),
+  review: (id: number, input: { status: string; notes?: string }) => request<Recording>(`/api/recordings/${id}/review`, { method: "PATCH", body: JSON.stringify(input) }),
+  history: (id: number) => request<{ reviews: any[]; audit: any[] }>(`/api/recordings/${id}/history`)
 };
 
 export const zoneApi = {
@@ -140,7 +142,9 @@ export const storageApi = {
   remove: (id: number) => request<void>(`/api/storage/servers/${id}`, { method: "DELETE" }),
   test: (id: number) => request<StorageProbe>(`/api/storage/servers/${id}/test`, { method: "POST" }),
   recordings: (id: number) => request<StorageRecording[]>(`/api/storage/servers/${id}/recordings`),
-  upload: (id: number, formData: FormData) => request<StorageRecording>(`/api/storage/servers/${id}/upload`, { method: "POST", body: formData })
+  upload: (id: number, formData: FormData) => request<StorageRecording>(`/api/storage/servers/${id}/upload`, { method: "POST", body: formData }),
+  deleteRecording: (serverId: number, fileId: string) => request<void>(`/api/storage/servers/${serverId}/recordings/${encodeURIComponent(fileId)}`, { method: "DELETE" }),
+  reviewRecording: (serverId: number, fileId: string, input: { status: string; notes?: string }) => request<StorageRecording>(`/api/storage/servers/${serverId}/recordings/${encodeURIComponent(fileId)}/review`, { method: "PATCH", body: JSON.stringify(input) })
 };
 
 export const settingsApi = { get: () => request<{ version: string; environment: string; storage_path: string; secrets_configured: boolean }>("/api/settings") };

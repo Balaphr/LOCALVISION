@@ -113,6 +113,17 @@ export function StoragePage() {
     }
   };
 
+  const removeRecording = async (serverId: number, fileId: string, name: string) => {
+    if (!window.confirm(`Delete ${name} permanently from Ubuntu storage?`)) return;
+    try {
+      await storageApi.deleteRecording(serverId, fileId);
+      setNotice("Recording deleted from Ubuntu storage");
+      await load(true);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not delete recording");
+    }
+  };
+
   const upload = async (event: React.FormEvent) => {
     event.preventDefault();
     const server = overview?.servers.find(item => item.connection === "Connected") ?? overview?.servers[0];
@@ -188,7 +199,7 @@ export function StoragePage() {
     <section className="settings-panel">
       <div className="section-title"><h2>Recording files</h2><span>Stored only on Ubuntu</span></div>
       <div className="admin-table-wrap"><table className="admin-table"><thead><tr><th>File</th><th>Camera</th><th>Size</th><th>Created</th><th>Actions</th></tr></thead><tbody>
-        {overview.recordings.map(recording => <tr key={`${recording.server_id}-${recording.id}`}><td><b>{recording.name}</b><small>{recording.path}</small></td><td>{recording.camera_id ?? "—"}</td><td>{formatBytes(recording.size_bytes)}</td><td>{formatDate(recording.created_at)}</td><td><div className="storage-actions"><button onClick={() => setPlaying(recording)}>Play</button><a className="button-link" href={recording.downloadUrl} download>Download</a></div></td></tr>)}
+        {overview.recordings.map(recording => <tr key={`${recording.server_id}-${recording.id}`}><td><b>{recording.name}</b><small>{recording.path}</small><small>review: {recording.review_status ?? "unreviewed"}</small></td><td>{recording.camera_id ?? "—"}</td><td>{formatBytes(recording.size_bytes)}</td><td>{formatDate(recording.created_at)}</td><td><div className="storage-actions"><button onClick={() => setPlaying(recording)}>Play</button><a className="button-link" href={recording.downloadUrl} download>Download</a><button onClick={() => void removeRecording(recording.server_id, recording.id, recording.name)}>Delete</button></div></td></tr>)}
         {!overview.recordings.length && <tr><td colSpan={5}>No recording files found on the connected Ubuntu storage server.</td></tr>}
       </tbody></table></div>
     </section>
