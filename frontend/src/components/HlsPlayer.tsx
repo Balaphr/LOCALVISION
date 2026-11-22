@@ -66,6 +66,7 @@ reloadTimer = window.setTimeout(() => {
         return;
       }
 hls = new Hls({
+         xhrSetup: (xhr: XMLHttpRequest) => { xhr.withCredentials = true; },
          lowLatencyMode: true,
          backBufferLength: 6,
          maxBufferLength: 8,
