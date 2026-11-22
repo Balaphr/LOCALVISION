@@ -1,3 +1,18 @@
+export interface PersonSession {
+  id: number;
+  camera_id?: number | null;
+  camera_name?: string | null;
+  object_name?: string | null;
+  entry_at: string;
+  last_seen_at?: string | null;
+  exit_at?: string | null;
+  duration_seconds?: number | null;
+  status: string;
+  activity?: string | null;
+  snapshot_path?: string | null;
+  snapshot_url?: string | null;
+}
+
 export interface EventItem {
   id: number;
   camera_id?: number | null;

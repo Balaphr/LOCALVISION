@@ -1,6 +1,6 @@
 import type { Camera, CameraInput, CameraStatus } from "../types/camera";
 import type { Recording, RecordingPage, Zone, ZoneInput } from "../types/recording";
-import type { AiChatResponse, AiModel, AiSettings, AiSettingsResponse, AiStatus, AlertItem, DiscoveryResult, EventItem, Integration, IntegrationInput, Metrics, SharingHistoryItem } from "../types/operations";
+import type { AiChatResponse, AiModel, AiSettings, AiSettingsResponse, AiStatus, AlertItem, DiscoveryResult, EventItem, Integration, IntegrationInput, Metrics, PersonSession, SharingHistoryItem } from "../types/operations";
 import type { LoginResponse, Role, Share, User, UserRecord } from "../types/auth";
 import type { StorageIntegration, StorageIntegrationInput, StorageOverview, StorageProbe, StorageRecording } from "../types/storage";
 import type { MonitoringFilters, MonitoringOverview, MonitoringUserDetail } from "../types/monitoring";
@@ -86,6 +86,7 @@ export interface AlertFilters {
 
 export const operationsApi = {
   events: (filters: EventFilters = {}) => request<{ items: EventItem[]; page: number; page_size: number }>(`/api/events?${queryString(filters)}`),
+  personSessions: (filters: { camera_id?: number; status?: string; search?: string; start?: string; end?: string; page_size?: number } = {}) => request<{ items: PersonSession[]; page: number; page_size: number }>(`/api/person-sessions?${queryString(filters)}`),
   detections: (filters: EventFilters = {}) => request<{ items: EventItem[]; page: number; page_size: number }>(`/api/detections?${queryString(filters)}`),
   alerts: (filters: AlertFilters = {}) => request<AlertItem[]>(`/api/alerts?${queryString(filters)}`),
   updateAlert: (id: number, status: "new" | "acknowledged" | "resolved") => request<AlertItem>(`/api/alerts/${id}`, { method: "PATCH", body: JSON.stringify({ status }) }),

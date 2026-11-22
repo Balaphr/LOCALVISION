@@ -291,7 +291,7 @@ def analyze_frame(camera_id: int, camera: str, timestamp: str, frame_bytes: byte
             "frame_width": width,
             "frame_height": height,
             "timestamp": timestamp,
-            "description": f"{label} detected in camera view"
+            "description": f"{label} detected in the {('left' if x + box_width // 2 < width // 3 else 'right' if x + box_width // 2 > 2 * width // 3 else 'center')} area of the camera view"
         })
         cv2.rectangle(annotated, (x, y), (x + box_width, y + box_height), (0, 255, 0), 2)
 

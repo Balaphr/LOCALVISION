@@ -289,6 +289,22 @@ const eventView = (item: any) => ({
   duration_seconds: item.duration_seconds ?? null
 });
 
+const personSessionView = (item: any) => ({
+  id: Number(item.id),
+  camera_id: item.camera_id ?? null,
+  camera_name: item.camera_name ?? null,
+  session_key: item.session_key ?? null,
+  object_name: item.object_name ?? "person",
+  entry_at: item.entry_at,
+  last_seen_at: item.last_seen_at ?? null,
+  exit_at: item.exit_at ?? null,
+  duration_seconds: item.duration_seconds ?? null,
+  status: item.status ?? "active",
+  activity: item.activity ?? null,
+  snapshot_path: item.snapshot_path ?? null,
+  snapshot_url: item.snapshot_path ? `/api/ai/snapshot?camera_id=${item.camera_id}&path=${encodeURIComponent(item.snapshot_path)}` : null
+});
+
 const alertView = (item: any) => ({
   id: item.id,
   camera_id: item.camera_id ?? null,
@@ -2309,6 +2325,17 @@ const bridgeEventIngest = async (request: Request, env: Env): Promise<Response> 
       await notifyIntegrations(env, alertView({ ...savedAlert, camera_name: camera.name }));
     }
   }
+  if (objectName.toLowerCase().includes("person")) {
+    await closeStalePersonSessions(env.DB, 90, occurredAt);
+    const recent = await first(env.DB, "SELECT * FROM person_sessions WHERE camera_id=? AND status='active' ORDER BY last_seen_at DESC LIMIT 1", cameraId);
+    const recentMs = recent ? Date.parse(recent.last_seen_at) : NaN;
+    const occurredMs = Date.parse(occurredAt) || Date.now();
+    if (recent && Number.isFinite(recentMs) && occurredMs - recentMs <= 90000) {
+      await run(env.DB, "UPDATE person_sessions SET last_seen_at=?, activity=?, snapshot_path=?, updated_at=? WHERE id=?", occurredAt, description, snapshotPath || recent.snapshot_path, stamp(), recent.id);
+    } else {
+      await run(env.DB, "INSERT INTO person_sessions (camera_id, session_key, object_name, entry_at, last_seen_at, status, activity, snapshot_path, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", cameraId, `${cameraId}-${occurredAt}-${Math.random().toString(36).slice(2, 8)}`, "person", occurredAt, occurredAt, "active", description, snapshotPath || null, stamp(), stamp());
+    }
+  }
   return json({ event_id: Number(saved?.id ?? 0), alert_id: alertId, snapshot_url: snapshotUrl }, 201);
 };
 
@@ -2483,6 +2510,69 @@ const eventsRoute = async (env: Env, url: URL, user: any, detectionsOnly = false
   params.push(pageSize, (page - 1) * pageSize);
   const items = (await all(env.DB, sql, ...params)).map(eventView);
   return { items, page, page_size: pageSize };
+};
+
+const closeStalePersonSessions = async (db: any, timeoutSeconds: number, now: string) => {
+  const nowMs = Date.parse(now) || Date.now();
+  const rows = await all(db, "SELECT * FROM person_sessions WHERE status='active'");
+  for (const row of rows) {
+    const lastMs = Date.parse(row.last_seen_at);
+    if (Number.isFinite(lastMs) && nowMs - lastMs > timeoutSeconds * 1000) {
+      const duration = Math.max(0, (lastMs - Date.parse(row.entry_at)) / 1000);
+      await run(db, "UPDATE person_sessions SET status='completed', exit_at=?, duration_seconds=?, updated_at=? WHERE id=?", row.last_seen_at, duration, now, row.id);
+    }
+  }
+};
+
+const personSessionsRoute = async (request: Request, env: Env, parts: string[], method: string, url: URL, user: any): Promise<Response> => {
+  await closeStalePersonSessions(env.DB, 90, new Date().toISOString());
+  const ids = await accessibleCameraIds(env.DB, user);
+  if (parts.length === 2 && method === "GET") {
+    const page = Math.max(1, Number(url.searchParams.get("page") ?? 1));
+    const pageSize = Math.max(1, Number(url.searchParams.get("page_size") ?? 50));
+    const params: any[] = [];
+    let sql = "SELECT s.*, c.name AS camera_name FROM person_sessions s LEFT JOIN cameras c ON c.id=s.camera_id WHERE 1=1";
+    sql += cameraFilterSql(ids, params, "s.camera_id", isAdmin(user));
+    const cameraId = url.searchParams.get("camera_id");
+    if (cameraId) {
+      const requested = Number(cameraId);
+      if (!ids.includes(requested)) return json({ items: [], page, page_size: pageSize });
+      sql += " AND s.camera_id=?";
+      params.push(requested);
+    }
+    const status = String(url.searchParams.get("status") ?? "").trim().toLowerCase();
+    if (["active", "completed"].includes(status)) { sql += " AND s.status=?"; params.push(status); }
+    const start = String(url.searchParams.get("start") ?? "").trim();
+    if (start) { sql += " AND s.entry_at>=?"; params.push(start); }
+    const end = String(url.searchParams.get("end") ?? "").trim();
+    if (end) { sql += " AND s.entry_at<=?"; params.push(end); }
+    const search = String(url.searchParams.get("search") ?? "").trim();
+    if (search) { sql += " AND (s.activity LIKE ? ESCAPE '\\' OR c.name LIKE ? ESCAPE '\\')"; const term = `%${escapeLike(search)}%`; params.push(term, term); }
+    sql += " ORDER BY s.entry_at DESC LIMIT ? OFFSET ?";
+    params.push(pageSize, (page - 1) * pageSize);
+    const items = (await all(env.DB, sql, ...params)).map(personSessionView);
+    return json({ items, page, page_size: pageSize });
+  }
+  const id = Number(parts[2]);
+  if (Number.isFinite(id) && parts.length === 3 && method === "GET") {
+    const row = await first(env.DB, "SELECT s.*, c.name AS camera_name FROM person_sessions s LEFT JOIN cameras c ON c.id=s.camera_id WHERE s.id=?", id);
+    if (!row) return fail("Person session not found", 404);
+    if (row.camera_id && !ids.includes(Number(row.camera_id))) return fail("Camera access is read-only", 403);
+    return json(personSessionView(row));
+  }
+  if (Number.isFinite(id) && parts.length === 4 && parts[3] === "close" && method === "POST") {
+    const row = await first(env.DB, "SELECT * FROM person_sessions WHERE id=?", id);
+    if (!row) return fail("Person session not found", 404);
+    if (row.camera_id && !ids.includes(Number(row.camera_id))) return fail("Camera access is read-only", 403);
+    const now = new Date().toISOString();
+    const lastMs = Date.parse(row.last_seen_at);
+    const entryMs = Date.parse(row.entry_at);
+    const duration = Number.isFinite(lastMs) && Number.isFinite(entryMs) ? Math.max(0, (lastMs - entryMs) / 1000) : null;
+    await run(env.DB, "UPDATE person_sessions SET status='completed', exit_at=?, duration_seconds=?, updated_at=? WHERE id=?", row.last_seen_at, duration, now, id);
+    const updated = await first(env.DB, "SELECT s.*, c.name AS camera_name FROM person_sessions s LEFT JOIN cameras c ON c.id=s.camera_id WHERE s.id=?", id);
+    return json(personSessionView(updated));
+  }
+  return fail("Not found", 404);
 };
 
 const alertsRoute = async (request: Request, env: Env, parts: string[], method: string, url: URL, user: any): Promise<Response> => {
@@ -2663,6 +2753,7 @@ const route = async (request: Request, env: Env): Promise<Response> => {
   if (path === "/api/events" || path === "/api/detections") {
     return json(await eventsRoute(env, url, user, path === "/api/detections"));
   }
+  if (parts[1] === "person-sessions") return personSessionsRoute(request, env, parts, method, url, user);
 
   if (parts[1] === "alerts") return alertsRoute(request, env, parts, method, url, user);
   if (path === "/api/sharing/history" && method === "GET") return sharingHistoryRoute(env, user);
