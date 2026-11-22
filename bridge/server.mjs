@@ -483,6 +483,17 @@ http.createServer((request, response) => {
     return;
   }
 
+  const cameraSnapshotMatch = pathname.match(/^\/camera\/(\d+)\/snapshot$/);
+  if (cameraSnapshotMatch && request.method === "GET") {
+    const session = getSession(Number(cameraSnapshotMatch[1]));
+    if (!session.camera?.source) {
+      sendJson(response, 422, { detail: "No RTSP source is configured for this camera" });
+      return;
+    }
+    snapshot(response, session.camera.source);
+    return;
+  }
+
   const cameraMatch = pathname.match(/^\/camera\/(\d+)\/(status|record\/start|record\/stop|record\/status)$/);
   if (cameraMatch) {
     const session = getSession(Number(cameraMatch[1]));

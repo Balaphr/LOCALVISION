@@ -629,10 +629,15 @@ const bridgeFetch = async (env: Env, path: string, init: RequestInit = {}): Prom
 
 const proxyMedia = async (request: Request, env: Env, camera: any, snapshotOnly: boolean): Promise<Response> => {
   try {
-    const source = await cameraSource(env, camera);
-    if (!source) return fail("No RTSP stream URL is configured for this camera.", 422);
-    const upstream = await bridgeFetch(env, snapshotOnly ? "/snapshot" : "/stream", {
-      headers: { "X-RTSP-URL": source, Accept: snapshotOnly ? "image/jpeg" : "multipart/x-mixed-replace" },
+    const path = snapshotOnly ? `/camera/${Number(camera.id)}/snapshot` : "/stream";
+    const headers: Record<string, string> = { Accept: snapshotOnly ? "image/jpeg" : "multipart/x-mixed-replace" };
+    if (!snapshotOnly) {
+      const source = await cameraSource(env, camera);
+      if (!source) return fail("No RTSP stream URL is configured for this camera.", 422);
+      headers["X-RTSP-URL"] = source;
+    }
+    const upstream = await bridgeFetch(env, path, {
+      headers,
       signal: request.signal
     });
     if (!upstream.ok) {
@@ -666,11 +671,12 @@ const proxyHls = async (env: Env, camera: any, segment?: string): Promise<Respon
       return new Response(upstream.body, { status: upstream.status, headers: { "content-type": "video/mp2t", "cache-control": "no-store" } });
     }
     const base = `/api/cameras/${Number(camera.id)}/hls/`;
-    const playlist = (await upstream.text()).split(/\r?\n/).map((line) => {
+    const lines = (await upstream.text()).split(/\r?\n/).map((line) => {
       const value = line.trim();
-      if (!value || value.startsWith("#") || /^[a-z]+:\/\//i.test(value)) return line;
+      if (!value || value.startsWith("#") || /^[a-z]+:\/\//i.test(value)) return value;
       return `${base}${encodeURIComponent(value.replace(/^\/+/, ""))}`;
-    }).join("\n");
+    }).filter(Boolean).filter(line => line !== "#EXTM3U");
+    const playlist = ["#EXTM3U", ...lines].join("\n") + "\n";
     return new Response(playlist, { status: upstream.status, headers: { "content-type": "application/vnd.apple.mpegurl", "cache-control": "no-store" } });
   } catch (error: any) {
     return fail(`Media bridge is unreachable: ${error?.message || "unknown error"}`, 502);
