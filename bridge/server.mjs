@@ -1,6 +1,6 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, statSync, existsSync, unlinkSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, statSync, existsSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { timingSafeEqual } from "node:crypto";
@@ -24,7 +24,7 @@ try {
 const port = Number(process.env.BRIDGE_PORT || 8792);
 const token = process.env.MEDIA_BRIDGE_TOKEN || "";
 const workerUrl = (process.env.WORKER_URL || "https://balasoftware.in").replace(/\/+$/, "");
-const configInterval = Math.max(5000, Number(process.env.BRIDGE_CONFIG_INTERVAL_MS || 10000));
+const configInterval = Math.max(3000, Number(process.env.BRIDGE_CONFIG_INTERVAL_MS || 5000));
 const recordingRoot = process.env.STORAGE_ROOT || path.join(process.cwd(), "recordings");
 const hlsRoot = path.join(recordingRoot, "hls");
 const segmentSeconds = Math.max(30, Number(process.env.RECORDING_SEGMENT_SECONDS || 3600));
@@ -68,12 +68,7 @@ const newDate = () => new Date();
 const datePart = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 const timePart = (date) => `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
 const cameraFolder = (camera) => `Camera-${Number(camera.id)}`;
-const segmentWindow = (started) => {
-  const nextHour = new Date(started);
-  nextHour.setHours(nextHour.getHours() + 1, 0, 0, 0);
-  const untilHour = Math.floor((nextHour.getTime() - started.getTime()) / 1000);
-  return Math.max(30, Math.min(segmentSeconds, untilHour > 30 ? untilHour : segmentSeconds));
-};
+const dayFolder = (root, folder, day) => path.join(root, "recordings", folder, day);
 
 const getSession = (id, camera) => {
   let session = sessions.get(Number(id));
@@ -99,12 +94,18 @@ const getSession = (id, camera) => {
       recordError: "",
       recordRestarts: 0,
       recordGeneration: 0,
+      recordSource: "",
+      recordActive: false,
+      recordIndex: null,
       lastRecordingAt: null,
       aiDesired: false,
       aiLoopActive: false,
       aiError: null,
       lastAiFrameAt: null,
-      aiDetections: 0
+      aiDetections: 0,
+      aiFrameProcess: null,
+      aiFrameSource: "",
+      aiLatestFrame: null
     };
     sessions.set(Number(id), session);
   }
@@ -275,7 +276,7 @@ const queueUpload = async (session, camera, file, metadata) => {
 const aiDefaults = {
   detection_confidence: 0.55,
   motion_threshold: 12,
-  frame_interval_ms: 10000,
+  frame_interval_ms: 5000,
   max_objects: 5,
   surveillance_enabled: true,
   alert_severity: "warning",
@@ -300,29 +301,71 @@ const settingsForCamera = (cameraId) => {
 
 const zonesForCamera = (cameraId) => aiState.zones.filter((zone) => Number(zone.camera_id) === Number(cameraId));
 
-const captureFrame = (source) => new Promise((resolve, reject) => {
-  const child = spawn(ffmpegPath, ffmpegArgs(source, true), { stdio: ["ignore", "pipe", "pipe"] });
-  const chunks = [];
-  let stderr = "";
-  let done = false;
-  const timer = setTimeout(() => child.kill("SIGKILL"), 15000);
-  child.stdout.on("data", (chunk) => chunks.push(chunk));
-  child.stderr.on("data", (chunk) => { stderr = redact(`${stderr}${chunk}`, source); });
-  child.once("error", (error) => {
-    if (done) return;
-    done = true;
-    clearTimeout(timer);
-    reject(new Error(redact(error.message, source)));
+const JPEG_START = Buffer.from([0xff, 0xd8]);
+const JPEG_END = Buffer.from([0xff, 0xd9]);
+
+const stopAiFrames = (session) => {
+  const child = session.aiFrameProcess;
+  session.aiFrameProcess = null;
+  session.aiFrameSource = "";
+  session.aiLatestFrame = null;
+  if (child && child.exitCode === null) {
+    try { child.kill("SIGTERM"); } catch {}
+  }
+};
+
+const startAiFrames = (session) => {
+  const camera = session.camera;
+  if (!camera?.source || !camera?.enabled) return;
+  if (session.aiFrameProcess && session.aiFrameProcess.exitCode === null) {
+    if (session.aiFrameSource === camera.source) return;
+    stopAiFrames(session);
+  }
+  const child = spawn(ffmpegPath, [
+    "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp",
+    "-thread_queue_size", "512", "-fflags", "nobuffer", "-flags", "low_delay",
+    "-analyzeduration", "1000000", "-probesize", "1000000",
+    "-i", camera.source, "-an",
+    "-vf", "fps=1,scale=640:-2",
+    "-c:v", "mjpeg", "-q:v", "6", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  session.aiFrameProcess = child;
+  session.aiFrameSource = camera.source;
+  let buffer = Buffer.alloc(0);
+  child.stdout.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (true) {
+      const start = buffer.indexOf(JPEG_START);
+      if (start < 0) {
+        buffer = buffer.subarray(Math.max(0, buffer.length - 3));
+        break;
+      }
+      const end = buffer.indexOf(JPEG_END, start + 2);
+      if (end < 0) break;
+      session.aiLatestFrame = { frame: Buffer.from(buffer.subarray(start, end + 2)), at: Date.now() };
+      buffer = buffer.subarray(end + 2);
+    }
   });
+  child.stderr.on("data", () => undefined);
   child.once("close", () => {
-    if (done) return;
-    done = true;
-    clearTimeout(timer);
-    const image = Buffer.concat(chunks);
-    if (image.includes(Buffer.from([0xff, 0xd8]))) resolve(image);
-    else reject(new Error(stderr || "No frame was received from the camera"));
+    if (session.aiFrameProcess !== child) return;
+    session.aiFrameProcess = null;
+    session.aiFrameSource = "";
+    if (session.aiDesired && aiState.running && session.camera?.source && session.camera?.enabled) {
+      setTimeout(() => startAiFrames(session), 2000).unref();
+    }
   });
-});
+};
+
+const latestAiFrame = async (session, timeoutMs = 6000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const latest = session.aiLatestFrame;
+    if (latest && Date.now() - latest.at <= 20000) return latest.frame;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error("No frame was received from the camera");
+};
 
 const reportAiEvent = async (payload) => {
   const response = await fetch(`${workerUrl}/api/bridge/events`, {
@@ -339,7 +382,7 @@ const analyzeFrame = async (session, camera) => {
   if (!storageConfig?.endpoint) throw new Error("Storage API is not configured");
   const settings = settingsForCamera(camera.id);
   const timestamp = new Date().toISOString();
-  const frame = await captureFrame(camera.source);
+  const frame = await latestAiFrame(session);
   const form = new FormData();
   form.append("frame", new Blob([frame], { type: "image/jpeg" }), "frame.jpg");
   form.append("camera_id", String(camera.id));
@@ -385,10 +428,12 @@ const aiLoop = async (session) => {
   while (aiState.running && session.aiDesired && session.camera?.source && session.camera?.enabled) {
     const settings = settingsForCamera(session.id);
     if (settings.surveillance_enabled === false || session.camera.ai_enabled === false) {
+      stopAiFrames(session);
       await new Promise(resolve => setTimeout(resolve, 1000));
       continue;
     }
     try {
+      startAiFrames(session);
       await analyzeFrame(session, session.camera);
       session.aiError = null;
       aiState.lastError = null;
@@ -400,6 +445,7 @@ const aiLoop = async (session) => {
     await new Promise(resolve => setTimeout(resolve, interval));
   }
   session.aiLoopActive = false;
+  stopAiFrames(session);
 };
 
 const startAi = (session) => {
@@ -409,6 +455,7 @@ const startAi = (session) => {
 
 const stopAi = (session) => {
   session.aiDesired = false;
+  stopAiFrames(session);
 };
 
 const refreshAiModels = async () => {
@@ -423,113 +470,207 @@ const refreshAiModels = async () => {
   aiState.models = models;
 };
 
-const recordChunk = async (session, source, file, duration) => {
-  const args = [
-    "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp",
-    "-fflags", "nobuffer", "-flags", "low_delay", "-analyzeduration", "1000000", "-probesize", "1000000",
-    "-i", source, "-t", String(duration), "-an",
-    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-y", file
-  ];
-  const child = spawn(ffmpegPath, args, { stdio: ["pipe", "ignore", "pipe"] });
-  session.recordProcess = child;
-  let stderr = "";
-  child.stderr.on("data", (chunk) => { stderr = redact(`${stderr}${chunk}`, source); });
-  const started = Date.now();
-  return await new Promise((resolve) => {
-    child.once("error", (error) => resolve({ code: -1, stderr: redact(error.message, source), started }));
-    child.once("close", (code) => resolve({ code, stderr, started }));
-  });
+const ensureRecordingDirs = (folder) => {
+  const now = Date.now();
+  for (const offset of [-86400000, 0, 86400000]) {
+    mkdirSync(dayFolder(recordingRoot, folder, datePart(new Date(now + offset))), { recursive: true });
+  }
 };
 
-const recordLoop = async (session, generation) => {
-  while (session.recordDesired && session.recordGeneration === generation && session.camera?.source) {
-    const camera = session.camera;
-    const started = newDate();
-    const date = datePart(started);
-    const time = timePart(started);
-    const folder = cameraFolder(camera);
-    const duration = segmentWindow(started);
-    const filename = `${folder}_${date}_${time.replace(/:/g, "-")}.mp4`;
-    const dir = path.join(recordingRoot, "recordings", folder, date);
-    mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, filename);
-    const metadata = {
-      camera_id: camera.id,
-      name: safeName(camera.name),
-      camera: folder,
-      date,
-      time,
-      filename,
-      duration_seconds: null,
-      size_bytes: 0,
-      status: "recording",
-      started_at: started.toISOString(),
-      ended_at: null
-    };
-    try {
-      await reportRecording(metadata).catch(() => null);
-      const result = await recordChunk(session, camera.source, file, duration);
-      if (session.recordProcess) session.recordProcess = null;
-      if (session.recordGeneration !== generation) {
-        const size = existsSync(file) ? statSync(file).size : 0;
-        if (size > 0) {
-          metadata.duration_seconds = duration;
-          metadata.size_bytes = size;
-          metadata.status = "ready";
-          metadata.ended_at = new Date(started.getTime() + duration * 1000).toISOString();
-          session.lastRecordingAt = metadata.ended_at;
-          await reportRecording(metadata).catch(() => null);
-          await queueUpload(session, camera, file, metadata);
-        }
-        return;
-      }
-      const size = existsSync(file) ? statSync(file).size : 0;
-      if (result.code === 0 && size > 0) {
-        metadata.duration_seconds = duration;
-        metadata.size_bytes = size;
-        metadata.ended_at = new Date(started.getTime() + duration * 1000).toISOString();
-        session.lastRecordingAt = metadata.ended_at;
-        session.recordStatus = "recording";
-        session.recordError = "";
-        await queueUpload(session, camera, file, metadata);
-      } else {
-        metadata.duration_seconds = 0;
-        metadata.size_bytes = size;
-        metadata.status = "error";
-        metadata.ended_at = new Date().toISOString();
-        await reportRecording(metadata).catch(() => null);
-        session.recordStatus = "reconnecting";
-        session.recordError = result.stderr || `Recording failed (${result.code})`;
-        session.recordRestarts += 1;
-        if (existsSync(file)) unlinkSync(file);
-      }
-    } catch (error) {
-      session.recordStatus = "error";
-      session.recordError = error instanceof Error ? error.message : "Recording failed";
+const recordingTemplate = (folder) => path.join(recordingRoot, "recordings", folder, "%Y-%m-%d", "%H-%M-%S.mp4");
+
+const recordingArgs = (source, folder) => [
+  "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp",
+  "-thread_queue_size", "512", "-fflags", "nobuffer", "-flags", "low_delay",
+  "-analyzeduration", "1000000", "-probesize", "1000000",
+  "-i", source, "-an",
+  "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+  "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+  "-f", "segment", "-segment_time", String(segmentSeconds),
+  "-segment_atclocktime", "1", "-reset_timestamps", "1",
+  "-strftime", "1", "-y", recordingTemplate(folder)
+];
+
+const indexStateFor = (session) => {
+  if (!session.recordIndex) session.recordIndex = { timer: null, busy: false, folder: "", reported: new Map(), queued: new Set() };
+  return session.recordIndex;
+};
+
+const listRecordingFiles = (folder) => {
+  const base = path.join(recordingRoot, "recordings", folder);
+  const days = [datePart(new Date(Date.now() - 86400000)), datePart(new Date())];
+  const files = [];
+  for (const day of days) {
+    let names = [];
+    try { names = readdirSync(path.join(base, day)); } catch { continue; }
+    for (const name of names) {
+      if (!name.toLowerCase().endsWith(".mp4")) continue;
+      try {
+        const stat = statSync(path.join(base, day, name));
+        files.push({ file: path.join(base, day, name), name, day, size: stat.size, mtime: stat.mtimeMs });
+      } catch {}
     }
-    if (session.recordDesired && session.recordGeneration === generation) await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  files.sort((left, right) => `${left.day}T${left.name}`.localeCompare(`${right.day}T${right.name}`));
+  return files;
+};
+
+const segmentStartMs = (day, name) => {
+  const time = String(name).slice(0, 8).replace(/-/g, ":");
+  const value = new Date(`${day}T${time}`).getTime();
+  return Number.isFinite(value) ? value : null;
+};
+
+const indexRecordings = async (session, folder, final = false) => {
+  const state = indexStateFor(session);
+  if (state.busy || !folder) return;
+  state.busy = true;
+  state.folder = folder;
+  try {
+    const files = listRecordingFiles(folder);
+    const now = Date.now();
+    const camera = session.camera;
+    for (let index = 0; index < files.length; index += 1) {
+      const entry = files[index];
+      const isOpen = index === files.length - 1 && !final && now - entry.mtime < 60000;
+      const status = isOpen ? "recording" : "ready";
+      const previous = state.reported.get(entry.name);
+      const changed = !previous || previous.size !== entry.size || previous.status !== status;
+      const due = changed && (!isOpen || !previous || now - (previous.at ?? 0) >= 15000);
+      const uploadDue = !isOpen && storageConfig?.endpoint && !!camera?.source && !state.queued.has(entry.name);
+      if (!due && !uploadDue) continue;
+      const startMs = segmentStartMs(entry.day, entry.name);
+      const next = files[index + 1];
+      let duration = null;
+      if (!isOpen) {
+        const endMs = next ? segmentStartMs(next.day, next.name) : entry.mtime;
+        duration = startMs && endMs > startMs
+          ? Math.max(1, Math.min(segmentSeconds, Math.round((endMs - startMs) / 1000)))
+          : segmentSeconds;
+      }
+      const metadata = {
+        camera_id: Number(camera?.id ?? session.id),
+        name: safeName(camera?.name ?? "Camera"),
+        camera: folder,
+        date: entry.day,
+        time: startMs ? timePart(new Date(startMs)) : "00:00:00",
+        filename: entry.name,
+        duration_seconds: duration,
+        size_bytes: entry.size,
+        status,
+        started_at: startMs ? new Date(startMs).toISOString() : new Date(entry.mtime).toISOString(),
+        ended_at: isOpen || !startMs || !duration ? null : new Date(startMs + duration * 1000).toISOString()
+      };
+      if (due) {
+        try {
+          await reportRecording(metadata);
+          state.reported.set(entry.name, { size: entry.size, status, at: Date.now() });
+        } catch {}
+      }
+      if (uploadDue) {
+        state.queued.add(entry.name);
+        void queueUpload(session, camera, entry.file, metadata).catch(() => undefined);
+      }
+      if (metadata.ended_at) session.lastRecordingAt = metadata.ended_at;
+      else session.lastRecordingAt = metadata.started_at;
+    }
+  } finally {
+    state.busy = false;
+  }
+};
+
+const startIndexing = (session, folder) => {
+  const state = indexStateFor(session);
+  state.folder = folder;
+  if (state.timer) clearInterval(state.timer);
+  state.timer = setInterval(() => { void indexRecordings(session, state.folder, false); }, 5000);
+  state.timer.unref();
+  void indexRecordings(session, folder, false);
+};
+
+const stopIndexing = (session) => {
+  const state = session.recordIndex;
+  if (!state?.timer) return;
+  clearInterval(state.timer);
+  state.timer = null;
+};
+
+const runRecorder = async (session, generation) => {
+  session.recordActive = true;
+  try {
+    while (session.recordDesired && session.recordGeneration === generation && session.camera?.source) {
+      const camera = session.camera;
+      const folder = cameraFolder(camera);
+      ensureRecordingDirs(folder);
+      let stderr = "";
+      const child = spawn(ffmpegPath, recordingArgs(camera.source, folder), { stdio: ["pipe", "ignore", "pipe"] });
+      session.recordProcess = child;
+      session.recordStatus = "starting";
+      child.stderr.on("data", (chunk) => { stderr = redact(`${stderr}${chunk}`, camera.source).slice(-1200); });
+      child.once("spawn", () => {
+        if (session.recordProcess === child && session.recordGeneration === generation) {
+          session.recordStatus = "recording";
+          session.recordError = "";
+        }
+      });
+      const code = await new Promise((resolve) => {
+        child.once("error", (error) => { stderr = redact(`${stderr}${error.message}`, camera.source); resolve(-1); });
+        child.once("close", (value) => resolve(value ?? 0));
+      });
+      if (session.recordProcess === child) session.recordProcess = null;
+      stopIndexing(session);
+      if (session.recordGeneration !== generation || !session.recordDesired) return;
+      await indexRecordings(session, folder, false).catch(() => undefined);
+      if (code === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        continue;
+      }
+      session.recordStatus = "reconnecting";
+      session.recordError = stderr || `Recording failed (${code})`;
+      session.recordRestarts += 1;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(10000, 1000 * session.recordRestarts)));
+    }
+  } finally {
+    if (session.recordGeneration === generation) session.recordActive = false;
   }
 };
 
 const startRecording = (session) => {
   if (!session.camera?.source) throw new Error("No RTSP source is configured for this camera");
-  if (session.recordDesired && session.recordStatus !== "stopped") return;
+  if (session.recordDesired && session.recordStatus !== "stopped" && session.recordActive && session.recordSource === session.camera.source) return;
+  if (session.recordDesired && session.recordStatus !== "stopped") {
+    session.recordGeneration += 1;
+    const previous = session.recordProcess;
+    session.recordProcess = null;
+    if (previous && previous.exitCode === null) {
+      try { previous.kill("SIGTERM"); } catch {}
+    }
+    stopIndexing(session);
+    session.recordDesired = false;
+    session.recordStatus = "stopped";
+  }
   session.recordGeneration += 1;
   session.recordDesired = true;
   session.recordStatus = "starting";
   session.recordError = "";
-  void recordLoop(session, session.recordGeneration);
+  session.recordSource = session.camera.source;
+  void runRecorder(session, session.recordGeneration);
 };
 
 const stopRecording = (session) => {
+  if (!session.recordDesired && session.recordStatus === "stopped" && !session.recordProcess) return;
   session.recordGeneration += 1;
   session.recordDesired = false;
   session.recordStatus = "stopped";
-  if (session.recordProcess && session.recordProcess.exitCode === null) {
-    session.recordProcess.stdin?.write("q\n");
-    setTimeout(() => session.recordProcess?.kill("SIGTERM"), 2000).unref();
-  }
+  const folder = session.recordIndex?.folder || (session.camera ? cameraFolder(session.camera) : "");
+  stopIndexing(session);
+  const child = session.recordProcess;
   session.recordProcess = null;
+  if (child && child.exitCode === null) {
+    try { child.stdin?.write("q\n"); } catch {}
+    setTimeout(() => { try { if (child.exitCode === null) child.kill("SIGTERM"); } catch {} }, 2000).unref();
+  }
+  if (folder) setTimeout(() => { void indexRecordings(session, folder, true).catch(() => undefined); }, 3500).unref();
 };
 
 const applyConfig = (config) => {
@@ -702,7 +843,9 @@ const hlsStatus = (session) => {
 const hlsPlaylist = async (response, session) => {
   const file = path.join(hlsRoot, String(session.id), "index.m3u8");
   let playlist = null;
-  for (let attempt = 0; attempt < 60; attempt += 1) {
+  const deadline = Date.now() + 4000;
+  while (Date.now() < deadline) {
+    if (session.hlsStatus === "stopped") break;
     if (existsSync(file) && statSync(file).size > 0) {
       const lines = readFileSync(file, "utf8").split(/\r?\n/).map(line => line.trim()).filter(Boolean);
       if (lines.some(line => line.endsWith(".ts"))) {
@@ -712,7 +855,7 @@ const hlsPlaylist = async (response, session) => {
         break;
       }
     }
-    await new Promise(resolve => setTimeout(resolve, 250));
+    await new Promise(resolve => setTimeout(resolve, 100));
   }
   if (!playlist) {
     sendJson(response, 503, { detail: "Live stream is starting or unavailable" });

@@ -25,6 +25,34 @@ const empty = () => new Response(null, { status: 204 });
 
 const stamp = () => new Date().toISOString();
 
+const cacheStore = new Map<string, { at: number; value: any }>();
+const inflightStore = new Map<string, Promise<any>>();
+
+const cached = async <T>(key: string, ttlMs: number, load: () => Promise<T>): Promise<T> => {
+  const hit = cacheStore.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return hit.value as T;
+  const pending = inflightStore.get(key);
+  if (pending) return await pending;
+  const promise = (async () => {
+    try {
+      const value = await load();
+      cacheStore.set(key, { at: Date.now(), value });
+      return value;
+    } finally {
+      inflightStore.delete(key);
+    }
+  })();
+  inflightStore.set(key, promise);
+  return await promise;
+};
+
+const invalidateCache = (...keys: string[]) => {
+  for (const key of keys) {
+    cacheStore.delete(key);
+    inflightStore.delete(key);
+  }
+};
+
 const bodyOf = async (request: Request): Promise<any> => {
   try {
     return (await request.json()) ?? {};
@@ -675,15 +703,16 @@ const importCamerasFromApi = async (request: Request, env: Env, user: any): Prom
   return json({ imported, skipped });
 };
 
-const bridgeFetch = async (env: Env, path: string, init: RequestInit = {}): Promise<Response> => {
+const bridgeFetch = async (env: Env, path: string, init: RequestInit & { timeoutMs?: number } = {}): Promise<Response> => {
   if (!env.MEDIA_BRIDGE_URL || !env.MEDIA_BRIDGE_TOKEN) throw new Error("Media bridge is not configured.");
   const target = new URL(path, env.MEDIA_BRIDGE_URL);
   const headers = new Headers(init.headers);
   headers.set("X-Bridge-Token", env.MEDIA_BRIDGE_TOKEN);
+  const { timeoutMs, ...rest } = init;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs ?? 8000);
   try {
-    return await fetch(target.toString(), { ...init, headers, signal: controller.signal });
+    return await fetch(target.toString(), { ...rest, headers, signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
@@ -988,6 +1017,7 @@ const recordingsRoute = async (request: Request, env: Env, parts: string[], meth
         await run(db, "DELETE FROM camera_recordings WHERE id=?", row.id);
         await run(db, "DELETE FROM recording_review_history WHERE recording_id=?", row.id);
       }
+      invalidateCache("storage:recordings");
       await audit(request, env, user, "recording.deleted", `${row.id}|${storedRecordingId(row)}|${row.filename ?? ""}`, Number(row.camera_id));
       return json({ deleted: true, storage_deleted: removed.deleted, storage_server_id: removed.storage_server_id });
     } catch (error: any) {
@@ -1530,21 +1560,22 @@ const storageRecordings = (payload: any): any[] => {
 
 const cameraKey = (value: any) => String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 
-const storageRecordingViews = async (db: any, env: Env): Promise<any[]> => {
+const storageRecordingViews = async (db: any, env: Env): Promise<any[]> => cached("storage:recordings", 10000, async () => {
   const servers = await all(db, "SELECT * FROM storage_servers WHERE enabled=1 ORDER BY id");
   const cameraRows = await all(db, "SELECT id,name,host FROM cameras");
   const views: any[] = [];
-  for (const server of servers) {
+  const batches = await Promise.all(servers.map(async (server: any, serverIndex: number) => {
+    const serverViews: any[] = [];
     try {
       const response = await storageFetch(env, server, "api/recordings");
-      if (!response.ok) continue;
+      if (!response.ok) return serverViews;
       const payload: any = await response.json().catch(() => ({}));
       for (const item of storageRecordings(payload)) {
         const key = cameraKey(item.camera);
         const matched = cameraRows.find((row: any) => cameraKey(row.name) === key || cameraKey(row.host) === key || cameraKey(`${row.name} ${row.host}`) === key);
         const startedAt = item.created_at || (item.date ? `${item.date}T${String(item.time ?? "00:00:00")}` : new Date().toISOString());
-        views.push({
-          id: -(views.length + 1),
+        serverViews.push({
+          id: -((serverIndex + 1) * 1000000 + serverViews.length + 1),
           camera_id: Number(item.camera_id) > 0 ? Number(item.camera_id) : matched ? Number(matched.id) : null,
           camera: item.camera,
           name: item.name || item.filename,
@@ -1568,9 +1599,11 @@ const storageRecordingViews = async (db: any, env: Env): Promise<any[]> => {
         });
       }
     } catch {}
-  }
+    return serverViews;
+  }));
+  for (const batch of batches) views.push(...batch);
   return views;
-};
+});
 
 const storageServersRoute = async (request: Request, env: Env, parts: string[], method: string, user: any): Promise<Response> => {
   const db = env.DB;
@@ -1603,6 +1636,7 @@ const storageServersRoute = async (request: Request, env: Env, parts: string[], 
       );
       const created = await first(db, "SELECT * FROM storage_servers ORDER BY id DESC LIMIT 1");
       const probe = await probeStorage(env, created, true);
+      invalidateCache("storage:overview", "storage:recordings");
       await audit(request, env, user, "storage.created", String(created.id));
       return json({ ...storageView(created), probe }, 201);
     }
@@ -1613,6 +1647,7 @@ const storageServersRoute = async (request: Request, env: Env, parts: string[], 
 
   if (parts[4] === "test" && method === "POST") {
     const probe = await probeStorage(env, item, true);
+    invalidateCache("storage:overview");
     await audit(request, env, user, "storage.tested", String(id));
     return json(probe);
   }
@@ -1692,6 +1727,7 @@ const storageServersRoute = async (request: Request, env: Env, parts: string[], 
         return fail(`Storage API returned HTTP ${response.status}: ${detail.slice(0, 500)}`, 502);
       }
       await audit(request, env, user, "storage.recording.deleted", fileId, null);
+      invalidateCache("storage:recordings", "storage:overview");
       return empty();
     } catch (error: any) {
       return fail(error?.message || "Could not delete stored recording", 502);
@@ -1715,6 +1751,7 @@ const storageServersRoute = async (request: Request, env: Env, parts: string[], 
       let saved: any;
       try { saved = JSON.parse(text); } catch { return fail("Storage API did not return valid upload JSON", 502); }
       const recording = normalizeRecording(saved.record ?? saved.file ?? saved, { camera, date });
+      invalidateCache("storage:recordings", "storage:overview");
       await audit(request, env, user, "storage.uploaded", String(id));
       return json({ ...recording, server_id: id, server_name: item.name, fileUrl: `/api/storage/servers/${id}/recordings/${encodeURIComponent(recording.id)}/file`, downloadUrl: `/api/storage/servers/${id}/recordings/${encodeURIComponent(recording.id)}/download` }, 201);
     } catch (error: any) {
@@ -1745,17 +1782,19 @@ const storageServersRoute = async (request: Request, env: Env, parts: string[], 
     fields.last_status = "unknown";
     const keys = Object.keys(fields);
     if (keys.length) await run(db, `UPDATE storage_servers SET ${keys.map((key) => `${key}=?`).join(",")}, updated_at=? WHERE id=?`, ...keys.map((key) => fields[key]), stamp(), id);
+    invalidateCache("storage:overview", "storage:recordings");
     return json(storageView(await first(db, "SELECT * FROM storage_servers WHERE id=?", id)));
   }
   if (parts.length === 4 && method === "DELETE") {
     await run(db, "DELETE FROM storage_servers WHERE id=?", id);
+    invalidateCache("storage:overview", "storage:recordings");
     await audit(request, env, user, "storage.deleted", String(id));
     return empty();
   }
   return fail("Not found", 404);
 };
 
-const storageOverview = async (env: Env): Promise<Response> => {
+const storageOverviewData = async (env: Env): Promise<any> => cached("storage:overview", 8000, async () => {
   const rows = await all(env.DB, "SELECT * FROM storage_servers ORDER BY id");
   const servers: any[] = [];
   const cameraUsage = new Map<number, any>();
@@ -1817,15 +1856,17 @@ const storageOverview = async (env: Env): Promise<Response> => {
     percent_used: totals.total_bytes ? Math.round((totals.used_bytes / totals.total_bytes) * 1000) / 10 : 0,
     source: "ubuntu-storage"
   };
-  return json({
+  return {
     local: zeroUsage("none"),
     servers,
     cameras,
     recordings,
     totals: combined,
     camera_count: cameraRows.length
-  });
-};
+  };
+});
+
+const storageOverview = async (env: Env): Promise<Response> => json(await storageOverviewData(env));
 
 const SESSION_ONLINE_WINDOW_MS = 5 * 60 * 1000;
 
@@ -1866,7 +1907,7 @@ const monitoringFilters = (url: URL) => ({
   recording_state: String(url.searchParams.get("recording_state") ?? "").trim().toLowerCase()
 });
 
-const bridgeCameraStatuses = async (env: Env) => {
+const bridgeCameraStatuses = async (env: Env) => cached("bridge:statuses", 3000, async () => {
   const statuses: Record<string, any> = {};
   const info = { status: "unavailable", config_loaded_at: null as any, config_error: null as any, error: null as any };
   if (env.MEDIA_BRIDGE_URL && env.MEDIA_BRIDGE_TOKEN) {
@@ -1903,7 +1944,7 @@ const bridgeCameraStatuses = async (env: Env) => {
     info.error = null;
   }
   return { statuses, info };
-};
+});
 
 const systemHealthFrom = (bridge: any, storages: Array<{ row: any; probe: any }>) => {
   const cameraStatuses = Object.values(bridge?.statuses ?? {}) as any[];
@@ -2366,7 +2407,7 @@ const aiSnapshotRoute = async (request: Request, env: Env, url: URL, user: any):
   }
 };
 
-const aiStatusPayload = async (env: Env, user: any) => {
+const aiStatusPayload = async (env: Env, user: any) => cached(`ai:status:${Number(user?.id ?? 0)}`, 4000, async () => {
   const ids = await accessibleCameraIds(env.DB, user);
   const filter = cameraFilterSql(ids, [], "camera_id", isAdmin(user));
   const [events, alerts, cameras] = await Promise.all([
@@ -2404,7 +2445,7 @@ const aiStatusPayload = async (env: Env, user: any) => {
     recent_events: events.slice(0, 10).map(eventView),
     recent_alerts: alerts.slice(0, 10).map(alertView)
   };
-};
+});
 
 const aiModelsRoute = async (env: Env): Promise<Response> => {
   try {
@@ -2970,15 +3011,18 @@ const route = async (request: Request, env: Env): Promise<Response> => {
     });
   }
   if (path === "/api/metrics" && method === "GET") {
-    const [bridge, storageRows, ai] = await Promise.all([
-      bridgeCameraStatuses(env),
-      all(env.DB, "SELECT * FROM storage_servers WHERE enabled=1 ORDER BY id"),
-      aiStatusPayload(env, user)
-    ]);
-    const storageProbes = await Promise.all(storageRows.map(async (row: any) => ({ row, probe: await probeStorage(env, row) })));
-    const metrics = systemHealthFrom(bridge, storageProbes);
-    metrics.ai = ai.status === "running" ? "ok" : "unavailable";
-    metrics.details.ai = ai.error || (ai.status === "running" ? `Local detector running · ${ai.counts.events} event(s)` : "Local detector is not running");
+    const metrics = await cached(`metrics:${Number(user?.id ?? 0)}`, 4000, async () => {
+      const [bridge, storageRows, ai] = await Promise.all([
+        bridgeCameraStatuses(env),
+        all(env.DB, "SELECT * FROM storage_servers WHERE enabled=1 ORDER BY id"),
+        aiStatusPayload(env, user)
+      ]);
+      const storageProbes = await Promise.all(storageRows.map(async (row: any) => ({ row, probe: await probeStorage(env, row) })));
+      const payload = systemHealthFrom(bridge, storageProbes);
+      payload.ai = ai.status === "running" ? "ok" : "unavailable";
+      payload.details.ai = ai.error || (ai.status === "running" ? `Local detector running · ${ai.counts.events} event(s)` : "Local detector is not running");
+      return payload;
+    });
     return json(metrics);
   }
   if (path === "/api/ai" && method === "GET") return json(await aiStatusPayload(env, user));

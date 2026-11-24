@@ -3,6 +3,7 @@ import base64
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -14,6 +15,9 @@ from ..config import get_settings
 from ..models.camera import Camera
 
 logger = logging.getLogger(__name__)
+
+capture_executor = ThreadPoolExecutor(max_workers=32, thread_name_prefix="stream-capture")
+media_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="media-write")
 
 
 @dataclass(frozen=True)
@@ -133,9 +137,10 @@ class StreamReader:
         self.status = "stopped"
 
     async def _loop(self) -> None:
+        loop = asyncio.get_running_loop()
         while not self.stop_event.is_set():
             try:
-                await asyncio.to_thread(self._read_until_failure)
+                await loop.run_in_executor(capture_executor, self._read_until_failure)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -156,9 +161,13 @@ class StreamReader:
             return
         self.status = "online"
         self.error = ""
-        delay = 1.0 / max(self.fps, 1.0)
+        reported = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        target_fps = reported if 1.0 <= reported <= 60.0 else 15.0
+        self.fps = target_fps
+        delay = 1.0 / target_fps
         try:
             while not self.stop_event.is_set():
+                started = time.monotonic()
                 ok, frame = capture.read()
                 if not ok or frame is None:
                     break
@@ -166,7 +175,9 @@ class StreamReader:
                     self.frame = frame
                     self.last_frame_at = time.monotonic()
                     self.version += 1
-                time.sleep(delay)
+                remaining = delay - (time.monotonic() - started)
+                if remaining > 0:
+                    time.sleep(remaining)
         finally:
             capture.release()
 

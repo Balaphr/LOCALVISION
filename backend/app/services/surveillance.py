@@ -23,7 +23,7 @@ from ..models.operations import Alert, Event, Integration, Recording
 from ..models.zones import DetectionZone
 from ..api.realtime import hub
 from .storage import LocalStorage
-from .streams import frame_hub
+from .streams import frame_hub, media_executor
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,9 @@ class SurveillanceWorker:
         self.supervisor: asyncio.Task[None] | None = None
         self.monitors: dict[int, asyncio.Task[None]] = {}
         self.status: dict[int, dict[str, object]] = {}
+        self.zone_cache: dict[int, tuple[float, list[DetectionZone]]] = {}
+        self.event_tasks: set[asyncio.Task[None]] = set()
+        self.event_semaphore = asyncio.Semaphore(4)
 
     async def start(self) -> None:
         if self.running:
@@ -83,6 +86,8 @@ class SurveillanceWorker:
         if self.supervisor is not None:
             self.supervisor.cancel()
         for task in list(self.monitors.values()):
+            task.cancel()
+        for task in list(self.event_tasks):
             task.cancel()
         await frame_hub.stop_all()
 
@@ -109,8 +114,10 @@ class SurveillanceWorker:
         settings = get_settings()
         tracker = Tracker()
         reader = await frame_hub.acquire(camera)
-        buffer: deque[tuple[float, Any]] = deque(maxlen=max(20, int(reader.fps * settings.clip_buffer_seconds)))
+        sample_interval = 1.0 / max(settings.detection_fps, 0.1)
+        buffer: deque[tuple[float, Any]] = deque(maxlen=max(20, int(settings.detection_fps * settings.clip_buffer_seconds) + 5))
         last_inference = 0.0
+        last_buffered = 0.0
         last_event: dict[int, float] = {}
         version = 0
         try:
@@ -121,8 +128,10 @@ class SurveillanceWorker:
                     continue
                 self.status[camera.id] = {"status": "online", "message": None}
                 now = time.monotonic()
-                buffer.append((now, frame))
-                if not camera.ai_enabled or now - last_inference < 1.0 / max(settings.detection_fps, 0.1):
+                if camera.recording_enabled and now - last_buffered >= sample_interval:
+                    buffer.append((now, frame))
+                    last_buffered = now
+                if not camera.ai_enabled or now - last_inference < sample_interval:
                     await asyncio.sleep(0.02)
                     continue
                 last_inference = now
@@ -134,33 +143,56 @@ class SurveillanceWorker:
                 relevant = [track for track in tracks if in_entrance_zone(track, zones, frame.shape[1], frame.shape[0])]
                 if not relevant:
                     continue
-                description = await describe_activity(relevant, bags, reader.jpeg())
-                for track in relevant:
-                    if now - last_event.get(track.id, 0) < settings.event_cooldown_seconds:
-                        continue
+                pending = [track for track in relevant if now - last_event.get(track.id, 0) >= settings.event_cooldown_seconds]
+                if not pending:
+                    continue
+                description = await describe_activity(pending, bags, reader.jpeg())
+                frames = list(buffer)
+                clip_fps = 1.0 / sample_interval
+                for track in pending:
                     last_event[track.id] = now
-                    await self._record_event(camera, track, description, frame, list(buffer), reader.fps)
+                    self._spawn_event(self._run_event(camera, track, description, frame, frames, clip_fps))
         except asyncio.CancelledError:
             pass
         except Exception as error:
             logger.warning("Camera %s monitor stopped: %s", camera.id, error)
             self.status[camera.id] = {"status": "error", "message": str(error)}
 
+    def _spawn_event(self, coroutine: Any) -> None:
+        task = asyncio.create_task(coroutine)
+        self.event_tasks.add(task)
+        task.add_done_callback(self.event_tasks.discard)
+
+    async def _run_event(self, camera: CameraConfig, track: Track, description: str, frame: Any, frames: list[tuple[float, Any]], fps: float) -> None:
+        async with self.event_semaphore:
+            try:
+                await self._record_event(camera, track, description, frame, frames, fps)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("Camera %s event write failed: %s", camera.id, error)
+
     async def _zones(self, camera_id: int) -> list[DetectionZone]:
+        cached = self.zone_cache.get(camera_id)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < 5.0:
+            return cached[1]
         async with SessionLocal() as db:
-            return list((await db.execute(select(DetectionZone).where(DetectionZone.camera_id == camera_id))).scalars())
+            zones = list((await db.execute(select(DetectionZone).where(DetectionZone.camera_id == camera_id))).scalars())
+        self.zone_cache[camera_id] = (now, zones)
+        return zones
 
     async def _record_event(self, camera: CameraConfig, track: Track, description: str, frame: Any, frames: list[tuple[float, Any]], fps: float) -> None:
-        settings = get_settings()
         storage = LocalStorage()
         timestamp = datetime.now(timezone.utc)
         snapshot = storage.snapshot_path(camera.id, timestamp, f"{timestamp.strftime('%H%M%S')}_{track.id}.jpg")
-        await asyncio.to_thread(cv2.imwrite, str(snapshot), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(media_executor, cv2.imwrite, str(snapshot), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         clip_path: Path | None = None
         recording_id: int | None = None
         if camera.recording_enabled and frames:
             clip_path = storage.recording_path(camera.id, timestamp, f"event_{timestamp.strftime('%H%M%S')}_{track.id}.mp4")
-            await asyncio.to_thread(self._write_clip, frames, clip_path, fps)
+            await loop.run_in_executor(media_executor, self._write_clip, frames, clip_path, fps)
             if clip_path.exists() and clip_path.stat().st_size > 0:
                 async with SessionLocal() as db:
                     recording = Recording(camera_id=camera.id, path=storage.relative(clip_path), started_at=timestamp, duration_seconds=len(frames) / max(fps, 1), size_bytes=clip_path.stat().st_size, kind="event", status="complete", ended_at=timestamp)

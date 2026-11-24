@@ -9,19 +9,20 @@ from .storage import LocalStorage
 
 @dataclass(frozen=True)
 class RecordingPolicy:
-    segment_seconds: int = 600
+    segment_seconds: int = 3600
     retention_days: int = 7
     mode: str = "continuous"
 
 
 class RecordingManager:
     def __init__(self, storage: LocalStorage | None = None, policy: RecordingPolicy | None = None):
+        settings = get_settings()
         self.storage = storage or LocalStorage()
-        self.policy = policy or RecordingPolicy()
+        self.policy = policy or RecordingPolicy(segment_seconds=settings.recording_segment_seconds, retention_days=settings.retention_days)
 
     def next_segment_path(self, camera: Camera) -> Path:
         now = datetime.now(timezone.utc)
-        return self.storage.recording_path(camera.id, now, f"{now.strftime('%H%M%S')}.mp4")
+        return self.storage.recording_path(camera.id, now, f"{now.strftime('%H-%M-%S')}.mp4")
 
     def retention_cutoff(self) -> datetime:
         from datetime import timedelta
@@ -33,4 +34,4 @@ class RecordingManager:
     async def start_segmenter(self, camera: Camera, ingest_port: int) -> asyncio.subprocess.Process:
         output = self.next_segment_path(camera)
         settings = get_settings()
-        return await asyncio.create_subprocess_exec(settings.ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-i", f"udp://{settings.media_udp_host}:{ingest_port}?overrun_nonfatal=1&fifo_size=1000000", "-map", "0", "-c", "copy", "-f", "segment", "-segment_time", str(self.policy.segment_seconds), "-reset_timestamps", "1", "-strftime", "1", str(output.with_name("%Y%m%d-%H%M%S.mp4")), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        return await asyncio.create_subprocess_exec(settings.ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-i", f"udp://{settings.media_udp_host}:{ingest_port}?overrun_nonfatal=1&fifo_size=1000000", "-map", "0", "-c", "copy", "-f", "segment", "-segment_time", str(self.policy.segment_seconds), "-segment_atclocktime", "1", "-reset_timestamps", "1", "-strftime", "1", str(output.with_name("%H-%M-%S.mp4")), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)

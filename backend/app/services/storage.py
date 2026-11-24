@@ -22,7 +22,7 @@ class LocalStorage:
             (self.root / directory).mkdir(parents=True, exist_ok=True)
 
     def recording_path(self, camera_id: int, timestamp: datetime, filename: str) -> Path:
-        path = self.root / "recordings" / str(camera_id) / timestamp.strftime("%Y/%m/%d")
+        path = self.root / "recordings" / str(camera_id) / timestamp.strftime("%Y-%m-%d")
         path.mkdir(parents=True, exist_ok=True)
         return path / filename
 

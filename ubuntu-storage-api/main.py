@@ -355,33 +355,38 @@ def storage(_: bool = Depends(authenticate)):
 @app.get("/api/cameras")
 def cameras(_: bool = Depends(authenticate)):
     result = []
-    if RECORDINGS.exists():
-        for folder in sorted(item for item in RECORDINGS.iterdir() if item.is_dir()):
-            files = list(folder.rglob("*.mp4"))
-            result.append({
-                "camera": folder.name,
-                "recording_directory_exists": True,
-                "recording_files": len(files)
-            })
+    counts: dict[str, int] = {}
+    for root in recording_roots():
+        if not root.exists():
+            continue
+        for folder in sorted(item for item in root.iterdir() if item.is_dir()):
+            if folder.name not in counts:
+                counts[folder.name] = 0
+            counts[folder.name] += sum(1 for _ in folder.rglob("*.mp4"))
+    for name in sorted(counts):
+        result.append({
+            "camera": name,
+            "recording_directory_exists": True,
+            "recording_files": counts[name]
+        })
     return {"cameras": result}
 
 
-@app.get("/api/recordings")
-def recordings(camera: str = "", date: str = "", _: bool = Depends(authenticate)):
-    camera_name = safe_camera(camera) if camera else ""
-    if date:
-        date = valid_date(date)
-    folder = (RECORDINGS / camera_name).resolve() if camera_name else RECORDINGS.resolve()
-    if not folder.is_relative_to(RECORDINGS.resolve()):
-        raise HTTPException(status_code=400, detail="Invalid path")
-    if not folder.exists():
-        return {"camera": camera_name, "date": date, "recordings": []}
+LISTING_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+LISTING_TTL_SECONDS = 5.0
 
-    items = []
-    for file in sorted(folder.rglob("*.mp4"), reverse=True):
-        relative = file.relative_to(RECORDINGS)
+
+def iter_recording_files(root: Path, camera_name: str, date: str):
+    base = (root / camera_name).resolve() if camera_name else root.resolve()
+    if not base.is_relative_to(root.resolve()) or not base.exists():
+        return
+    for file in sorted(base.rglob("*.mp4"), reverse=True):
+        relative = file.relative_to(root)
         parts = relative.parts
-        if len(parts) >= 3:
+        if len(parts) >= 4 and len(parts[1]) == 4 and parts[1].isdigit():
+            file_camera = parts[0]
+            file_date = f"{parts[1]}-{parts[2]}-{parts[3]}"
+        elif len(parts) >= 3:
             file_camera = parts[0]
             file_date = parts[1]
         elif len(parts) == 2:
@@ -394,22 +399,50 @@ def recordings(camera: str = "", date: str = "", _: bool = Depends(authenticate)
             continue
         if date and file_date != date:
             continue
-    review = read_review(file)
-    items.append({
-        "id": recording_id(file_camera, file_date, file.name),
-        "name": file.name,
-        "camera": file_camera,
-        "date": file_date,
-        "path": str(relative),
-        "filename": file.name,
-        "size_bytes": file.stat().st_size,
-        "modified": datetime.fromtimestamp(file.stat().st_mtime, timezone.utc).isoformat(),
-        "mime_type": mimetypes.guess_type(file.name)[0] or "video/mp4",
-        "review_status": review.get("review_status", "unreviewed"),
-        "reviewed_by": review.get("reviewed_by"),
-        "reviewed_at": review.get("reviewed_at"),
-    })
-    return {"camera": camera_name, "date": date, "recordings": items}
+        yield file, file_camera, file_date, relative
+
+
+@app.get("/api/recordings")
+def recordings(camera: str = "", date: str = "", _: bool = Depends(authenticate)):
+    camera_name = safe_camera(camera) if camera else ""
+    if date:
+        date = valid_date(date)
+    cache_key = (camera_name, date)
+    cached = LISTING_CACHE.get(cache_key)
+    now = datetime.now(timezone.utc).timestamp()
+    if cached and now - cached[0] < LISTING_TTL_SECONDS:
+        return cached[1]
+
+    seen: set[tuple[str, str, str]] = set()
+    items = []
+    for root in recording_roots():
+        for file, file_camera, file_date, relative in iter_recording_files(root, camera_name, date):
+            key = (file_camera, file_date, file.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            review = read_review(file)
+            stat = file.stat()
+            items.append({
+                "id": recording_id(file_camera, file_date, file.name),
+                "name": file.name,
+                "camera": file_camera,
+                "camera_id": camera_id_from_name(file_camera),
+                "date": file_date,
+                "path": str(relative),
+                "filename": file.name,
+                "size_bytes": stat.st_size,
+                "created_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+                "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+                "mime_type": mimetypes.guess_type(file.name)[0] or "video/mp4",
+                "review_status": review.get("review_status", "unreviewed"),
+                "reviewed_by": review.get("reviewed_by"),
+                "reviewed_at": review.get("reviewed_at"),
+            })
+    items.sort(key=lambda item: item["created_at"], reverse=True)
+    payload = {"camera": camera_name, "date": date, "recordings": items}
+    LISTING_CACHE[cache_key] = (now, payload)
+    return payload
 
 
 @app.delete("/api/recordings/{recording_id}")

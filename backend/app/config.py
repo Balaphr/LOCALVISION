@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     webrtc_gateway_url: str = "http://127.0.0.1:1984"
     media_udp_host: str = "127.0.0.1"
     media_udp_port_start: int = 12000
-    recording_segment_seconds: int = 600
+    recording_segment_seconds: int = 3600
     retention_days: int = 7
     low_storage_percent: int = 10
     onvif_discovery_enabled: bool = False

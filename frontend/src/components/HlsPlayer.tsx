@@ -47,7 +47,7 @@ reloadTimer = window.setTimeout(() => {
          video.removeAttribute("src");
          video.load();
          start();
-       }, Math.min(5000, 1000 * retries));
+       }, Math.min(3000, 400 * Math.max(retries, 1)));
     };
 
     const start = () => {
@@ -72,12 +72,12 @@ hls = new Hls({
          maxBufferLength: 8,
          maxMaxBufferLength: 16,
          enableWorker: true,
-         manifestLoadingMaxRetry: 8,
-         manifestLoadingRetryDelay: 1000,
-         levelLoadingMaxRetry: 8,
-         levelLoadingRetryDelay: 1000,
-         fragLoadingMaxRetry: 8,
-         fragLoadingRetryDelay: 1000,
+         manifestLoadingMaxRetry: 6,
+         manifestLoadingRetryDelay: 400,
+         levelLoadingMaxRetry: 6,
+         levelLoadingRetryDelay: 400,
+         fragLoadingMaxRetry: 6,
+         fragLoadingRetryDelay: 400,
          liveSyncDurationCount: 2,
          liveMaxLatencyDurationCount: 6,
          maxLiveSyncPlaybackRate: 1.2
@@ -121,7 +121,7 @@ hls = new Hls({
         lastProgress = Date.now();
         return;
       }
-      if (Date.now() - lastProgress > 15000) reconnect();
+      if (Date.now() - lastProgress > 8000) reconnect();
     }, 2000);
 
     return () => {

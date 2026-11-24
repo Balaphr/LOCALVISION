@@ -5,7 +5,24 @@ import type { LoginResponse, Role, Share, User, UserRecord } from "../types/auth
 import type { StorageIntegration, StorageIntegrationInput, StorageOverview, StorageProbe, StorageRecording } from "../types/storage";
 import type { MonitoringFilters, MonitoringOverview, MonitoringUserDetail } from "../types/monitoring";
 
+const responseCache = new Map<string, { at: number; value: unknown }>();
+
+const cacheTtlFor = (path: string): number => {
+  const pathname = path.split("?")[0];
+  if (pathname === "/api/metrics" || pathname === "/api/cameras" || pathname === "/api/recordings" || pathname.startsWith("/api/cameras/")) return 5000;
+  if (pathname === "/api/events" || pathname === "/api/detections") return 3000;
+  if (pathname.startsWith("/api/storage") || pathname.startsWith("/api/ai") || pathname === "/api/alerts") return 6000;
+  if (pathname.startsWith("/api/auth/") || pathname === "/api/settings") return 3000;
+  return 4000;
+};
+
 const request = async <T>(path: string, options?: RequestInit): Promise<T> => {
+  const method = String(options?.method ?? "GET").toUpperCase();
+  const cacheable = method === "GET" && options?.body === undefined;
+  if (cacheable) {
+    const hit = responseCache.get(path);
+    if (hit && Date.now() - hit.at < cacheTtlFor(path)) return hit.value as T;
+  }
   const headers = new Headers(options?.headers);
   if (!(options?.body instanceof FormData) && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const response = await fetch(path, { ...options, headers, credentials: "include" });
@@ -14,7 +31,10 @@ const request = async <T>(path: string, options?: RequestInit): Promise<T> => {
     if (response.status === 502 && !detail) throw new Error("LocalVision API is unavailable. Start the FastAPI backend on port 8000, then try again.");
     throw new Error(typeof detail === "string" ? detail : detail ? JSON.stringify(detail) : `Request failed (${response.status})`);
   }
-  return response.status === 204 ? (undefined as T) : response.json();
+  const result = response.status === 204 ? (undefined as T) : await response.json();
+  if (cacheable) responseCache.set(path, { at: Date.now(), value: result });
+  else if (method !== "GET") responseCache.clear();
+  return result;
 };
 
 const queryString = (filters: object) =>

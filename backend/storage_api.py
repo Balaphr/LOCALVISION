@@ -54,9 +54,11 @@ def recording_entry(path: Path) -> dict[str, Any]:
     if not date:
         date = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime("%Y-%m-%d")
     stat = path.stat()
+    match = re.fullmatch(r"Camera-(\d+)", camera, re.IGNORECASE)
     return {
         "id": encode_id(relative),
         "camera": camera,
+        "camera_id": int(match.group(1)) if match else None,
         "date": date,
         "filename": path.name,
         "name": path.name,

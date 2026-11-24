@@ -24,7 +24,6 @@ import { UsersPage } from "./pages/UsersPage";
 import type { User } from "./types/auth";
 import { useRealtime } from "./hooks/useRealtime";
 import type { RealtimeMessage } from "./hooks/useRealtime";
-import { SplashScreen } from "./components/SplashScreen";
 import "./styles.css";
 
 const labels: Record<string, [string, string]> = { live: ["Live View", "Low-latency playback is provided by the configured media gateway."], events: ["Events", "Review local AI and system events."], alerts: ["Alerts", "Review and configure optional notification providers."], storage: ["Storage", "Review local volume and retention health."], users: ["Users", "Manage users and roles."], integrations: ["API Integrations", "Configure optional encrypted webhook integrations."], settings: ["Settings", "Configure LocalVision runtime settings."], system: ["System", "Review service and host health."] };
@@ -33,7 +32,6 @@ const roleRank: Record<string, number> = { viewer: 1, operator: 2, admin: 3 };
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [showSplash, setShowSplash] = useState(false);
   const [showLanding, setShowLanding] = useState(true);
   const [page, setPage] = useState("dashboard");
   const [cameras, setCameras] = useState<Camera[]>([]);
@@ -44,11 +42,11 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
+    void cameraApi.list().then(list => { if (active) setCameras(list); }).catch(() => undefined);
     void authApi.me().then(nextUser => {
       if (!active) return;
       setUser(nextUser);
       setShowLanding(false);
-      setShowSplash(true);
     }).catch(() => {
       if (active) setUser(null);
     }).finally(() => {
@@ -112,8 +110,7 @@ export default function App() {
   };
 
   if (authLoading) return <div className="loading-screen">Checking secure session…</div>;
-  if (showLanding || !user) return <LandingPage onAuthenticated={nextUser => { setUser(nextUser); setPage("dashboard"); setShowSplash(true); setShowLanding(false); }} />;
-  if (showSplash) return <SplashScreen onComplete={() => setShowSplash(false)} />;
+  if (showLanding || !user) return <LandingPage onAuthenticated={nextUser => { setUser(nextUser); setPage("dashboard"); setShowLanding(false); }} />;
 
   const content = page === "dashboard" ? <Dashboard cameras={cameras} user={user} />
     : page === "live" ? <LivePage cameras={cameras} detections={detections} />
@@ -128,7 +125,7 @@ export default function App() {
     : page === "storage" ? (user.role === "admin" ? <StoragePage /> : <PlaceholderPage title="Storage access restricted" description="Only administrators can review global storage capacity and server connections." />)
     : page === "users" ? (user.role === "admin" ? <UsersPage currentUser={user} /> : <PlaceholderPage title="User management restricted" description="Only administrators can manage accounts and permissions." />)
     : page === "integrations" ? <IntegrationsPage canWrite={canWrite} />
-    : page === "settings" ? <AccountSettings user={user} canManageUsers={canManageUsers} onLogout={async () => { try { await authApi.logout(); } finally { setUser(null); setPage("dashboard"); setShowSplash(false); } }} />
+    : page === "settings" ? <AccountSettings user={user} canManageUsers={canManageUsers} onLogout={async () => { try { await authApi.logout(); } finally { setUser(null); setPage("dashboard"); } }} />
     : page === "system" ? (user.role === "admin" ? <SystemPage role={user.role} /> : <PlaceholderPage title="System monitoring restricted" description="Only administrators can view global activity, camera, recording, and storage reports." />)
     : <PlaceholderPage title={labels[page]?.[0] ?? page} description={labels[page]?.[1] ?? "This area is ready for the next implementation phase."} />;
 
