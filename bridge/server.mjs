@@ -1,18 +1,39 @@
 import http from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, statSync, existsSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { timingSafeEqual } from "node:crypto";
 import ffmpegPath from "ffmpeg-static";
+
+const probeEncoder = (candidate) => {
+  try {
+    execFileSync(ffmpegPath, ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=5", "-frames:v", "1", "-c:v", candidate, "-f", "null", "-"], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "pipe"] });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 let videoEncoder = "libx264";
 try {
-  const { execFileSync } = await import("node:child_process");
   const encoders = execFileSync(ffmpegPath, ["-hide_banner", "-encoders"], { encoding: "utf8", timeout: 10000 });
-  if (/h264_nvenc/.test(encoders)) videoEncoder = "h264_nvenc";
-  else if (/h264_qsv/.test(encoders)) videoEncoder = "h264_qsv";
-  else if (/h264_vaapi/.test(encoders)) videoEncoder = "h264_vaapi";
-} catch {}
+  const candidates = [];
+  const configured = String(process.env.VIDEO_ENCODER || "").trim();
+  if (configured) candidates.push(configured);
+  if (/h264_nvenc/.test(encoders)) candidates.push("h264_nvenc");
+  if (/h264_qsv/.test(encoders)) candidates.push("h264_qsv");
+  if (/h264_vaapi/.test(encoders)) candidates.push("h264_vaapi");
+  candidates.push("libx264");
+  for (const candidate of [...new Set(candidates)]) {
+    if (probeEncoder(candidate)) {
+      videoEncoder = candidate;
+      break;
+    }
+  }
+} catch {
+  videoEncoder = "libx264";
+}
 
 try {
   for (const line of readFileSync(new URL("./.env", import.meta.url), "utf8").split(/\r?\n/)) {
@@ -88,6 +109,8 @@ const getSession = (id, camera) => {
       hlsSpeed: null,
       hlsStartedAt: null,
       hlsLastStatsAt: null,
+      hlsRestartTimer: null,
+      hlsLastHealAt: 0,
       recordDesired: false,
       recordProcess: null,
       recordStatus: "stopped",
@@ -116,6 +139,10 @@ const getSession = (id, camera) => {
 const startHls = (session) => {
   const camera = session.camera;
   if (!camera?.enabled || !camera.source) return;
+  if (session.hlsRestartTimer) {
+    clearTimeout(session.hlsRestartTimer);
+    session.hlsRestartTimer = null;
+  }
   if (session.hlsProcess && session.hlsProcess.exitCode === null && session.hlsSource !== camera.source) stopHls(session);
   if (session.hlsStarting && session.hlsSource !== camera.source) {
     session.hlsProcess?.kill("SIGTERM");
@@ -181,11 +208,23 @@ const startHls = (session) => {
     if (!session.camera?.enabled || session.hlsSource !== camera.source) return;
     session.hlsStatus = "reconnecting";
     session.hlsRestarts += 1;
-    setTimeout(() => startHls(session), Math.min(10000, 1000 * session.hlsRestarts));
+    if (videoEncoder !== "libx264" && /encoder|nvenc|nvcuda|qsv|vaapi|cannot load|not found/i.test(session.hlsError)) {
+      videoEncoder = "libx264";
+      session.hlsRestarts = 0;
+    }
+    if (session.hlsRestartTimer) return;
+    session.hlsRestartTimer = setTimeout(() => {
+      session.hlsRestartTimer = null;
+      startHls(session);
+    }, Math.min(10000, 1000 * Math.max(session.hlsRestarts, 1)));
   });
 };
 
 const stopHls = (session) => {
+  if (session.hlsRestartTimer) {
+    clearTimeout(session.hlsRestartTimer);
+    session.hlsRestartTimer = null;
+  }
   session.hlsSource = "";
   session.hlsStarting = false;
   session.hlsStatus = "stopped";
@@ -823,9 +862,12 @@ const hlsStatus = (session) => {
   let lastFrameAt = null;
   try { lastFrameAt = new Date(statSync(playlist).mtimeMs).toISOString(); } catch {}
   const queueErrors = [...uploadQueue.values()].filter(item => item.sessionId === session.id).map(item => item.error).filter(Boolean);
+  let status = session.hlsStatus === "online" ? (lastFrameAt ? "online" : "starting") : session.hlsStatus;
+  if (status === "online" && lastFrameAt && Date.now() - Date.parse(lastFrameAt) > 8000) status = "reconnecting";
+  if (status === "online" && !lastFrameAt && session.hlsStartedAt && Date.now() - Date.parse(session.hlsStartedAt) > 8000) status = "reconnecting";
   return {
     camera_id: session.id,
-    status: session.hlsStatus === "online" ? (lastFrameAt ? "online" : "starting") : session.hlsStatus,
+    status,
     message: session.hlsError || configError || null,
     resolution: session.hlsResolution,
     fps: session.hlsFps,
@@ -840,22 +882,54 @@ const hlsStatus = (session) => {
   };
 };
 
+const readPlaylist = (file) => {
+  if (!existsSync(file) || statSync(file).size <= 0) return null;
+  let lines;
+  try { lines = readFileSync(file, "utf8").split(/\r?\n/).map(line => line.trim()).filter(Boolean); } catch { return null; }
+  const out = [];
+  let kept = 0;
+  let dropped = 0;
+  for (const line of lines) {
+    if (!line.endsWith(".ts")) {
+      out.push(line);
+      continue;
+    }
+    const segmentFile = path.join(path.dirname(file), path.basename(line));
+    if (existsSync(segmentFile)) {
+      out.push(line);
+      kept += 1;
+    } else {
+      dropped += 1;
+      if (out.length && out[out.length - 1].startsWith("#EXTINF")) out.pop();
+    }
+  }
+  if (!kept) return null;
+  if (dropped > 0) {
+    const index = out.findIndex(line => line.startsWith("#EXT-X-MEDIA-SEQUENCE:"));
+    if (index >= 0) {
+      const current = Number(out[index].split(":")[1]) || 0;
+      out[index] = `#EXT-X-MEDIA-SEQUENCE:${current + dropped}`;
+    }
+  }
+  if (!out.includes("#EXTM3U")) out.unshift("#EXTM3U");
+  return Buffer.from(out.join("\n") + "\n");
+};
+
 const hlsPlaylist = async (response, session) => {
   const file = path.join(hlsRoot, String(session.id), "index.m3u8");
+  const startedAt = Date.now();
+  const deadline = startedAt + 4000;
   let playlist = null;
-  const deadline = Date.now() + 4000;
   while (Date.now() < deadline) {
-    if (session.hlsStatus === "stopped") break;
-    if (existsSync(file) && statSync(file).size > 0) {
-      const lines = readFileSync(file, "utf8").split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-      if (lines.some(line => line.endsWith(".ts"))) {
-        const header = lines.filter(line => line === "#EXTM3U");
-        const body = lines.filter(line => line !== "#EXTM3U");
-        playlist = Buffer.from([...(header.length ? header : ["#EXTM3U"]), ...body].join("\n") + "\n");
-        break;
-      }
-    }
+    playlist = readPlaylist(file);
+    if (playlist) break;
+    if (session.hlsStatus === "stopped" && Date.now() - startedAt > 1000) break;
     await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  const healedAt = session.hlsStartedAt ? Date.now() - Date.parse(session.hlsStartedAt) : 0;
+  if (!playlist && ["online", "starting"].includes(session.hlsStatus) && healedAt > 10000 && session.hlsProcess && session.hlsProcess.exitCode === null && Date.now() - session.hlsLastHealAt > 15000) {
+    session.hlsLastHealAt = Date.now();
+    try { session.hlsProcess.kill("SIGTERM"); } catch {}
   }
   if (!playlist) {
     sendJson(response, 503, { detail: "Live stream is starting or unavailable" });

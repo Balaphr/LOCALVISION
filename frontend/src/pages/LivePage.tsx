@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Camera, CameraStatus } from "../types/camera";
 import type { RealtimeMessage } from "../hooks/useRealtime";
 import { HlsPlayer } from "../components/HlsPlayer";
+import type { StreamState } from "../components/HlsPlayer";
 import { cameraApi } from "../services/api";
 
 const layoutOptions = [0, 1, 2, 3, 4];
@@ -55,6 +56,7 @@ export function LivePage({ cameras, detections }: Props) {
   const [statuses, setStatuses] = useState<Record<number, CameraStatus>>({});
   const [recordings, setRecordings] = useState<Record<number, RecordingState>>({});
   const [busy, setBusy] = useState<Record<number, boolean>>({});
+  const [playStates, setPlayStates] = useState<Record<number, StreamState>>({});
   const timer = useRef<number | null>(null);
   const visible = useMemo(() => cameras.filter(camera => camera.enabled), [cameras]);
   const columns = layout || Math.min(visible.length || 1, Math.max(1, Math.ceil(Math.sqrt(visible.length || 1))));
@@ -88,7 +90,7 @@ export function LivePage({ cameras, detections }: Props) {
 
   useEffect(() => {
     void refresh();
-    timer.current = window.setInterval(() => void refresh(), 10000);
+    timer.current = window.setInterval(() => void refresh(), 5000);
     return () => {
       if (timer.current !== null) window.clearInterval(timer.current);
     };
@@ -134,11 +136,18 @@ export function LivePage({ cameras, detections }: Props) {
         const status = statuses[camera.id];
         const recording = recordings[camera.id];
         const recordingActive = recording?.status === "recording";
-        const statusText = status?.message || status?.status || "Connecting";
+        const label = streamLabel(status);
+        const playState = playStates[camera.id];
+        const badge = playState === "playing" ? "LIVE"
+          : playState === "stalled" || playState === "error" ? "STALLED"
+          : label === "LIVE" ? "CONNECTING"
+          : label;
+        const rawStatus = String(status?.message || status?.status || "Connecting");
+        const statusText = rawStatus.split(/\r?\n/)[0].trim().slice(0, 90);
         return <article className={`live-tile ${selected === camera.id ? "selected" : ""}`} key={camera.id} onClick={() => setSelected(camera.id)}>
           <div className="live-canvas" style={{ transform: `scale(${zoom})` }}>
-            {camera.enabled ? <HlsPlayer src={cameraApi.streamUrl(camera.id)} className="live-stream" /> : <div className="live-offline">Camera disabled</div>}
-            <span className={`live-badge ${streamLabel(status) === "LIVE" ? "" : "degraded"}`}>● {streamLabel(status)}</span>
+            {camera.enabled ? <HlsPlayer src={cameraApi.streamUrl(camera.id)} className="live-stream" onStateChange={next => setPlayStates(previous => previous[camera.id] === next ? previous : { ...previous, [camera.id]: next })} /> : <div className="live-offline">Camera disabled</div>}
+            <span className={`live-badge ${badge === "LIVE" ? "" : "degraded"}`}>● {badge}</span>
             <span className="live-spec">{camera.protocol} · {camera.location || camera.host}{statusText ? ` · ${statusText}` : ""}</span>
             {cameraDetections.map((message, index) => {
               const box = boxStyle(message);

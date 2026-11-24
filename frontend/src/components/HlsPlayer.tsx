@@ -1,14 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
 
+export type StreamState = "idle" | "playing" | "stalled" | "error";
+
 interface Props {
   src: string;
   className?: string;
+  onStateChange?: (state: StreamState) => void;
 }
 
-export function HlsPlayer({ src, className }: Props) {
+export function HlsPlayer({ src, className, onStateChange }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [error, setError] = useState("");
+  const stateRef = useRef<StreamState>("idle");
+
+  useEffect(() => { stateRef.current = "idle"; onStateChange?.("idle"); }, [src]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -20,6 +26,13 @@ export function HlsPlayer({ src, className }: Props) {
     let stallTimer: number | null = null;
     let lastTime = -1;
     let lastProgress = Date.now();
+    let frozenSince: number | null = null;
+
+    const reportState = (state: StreamState) => {
+      if (stateRef.current === state) return;
+      stateRef.current = state;
+      onStateChange?.(state);
+    };
 
     const clearReload = () => {
       if (reloadTimer === null) return;
@@ -40,14 +53,15 @@ export function HlsPlayer({ src, className }: Props) {
       if (!active || reloadTimer !== null) return;
       retries += 1;
       setError("Reconnecting…");
+      reportState("stalled");
       clearReload();
-reloadTimer = window.setTimeout(() => {
-         reloadTimer = null;
-         destroyHls();
-         video.removeAttribute("src");
-         video.load();
-         start();
-       }, Math.min(3000, 400 * Math.max(retries, 1)));
+      reloadTimer = window.setTimeout(() => {
+        reloadTimer = null;
+        destroyHls();
+        video.removeAttribute("src");
+        video.load();
+        start();
+      }, Math.min(5000, 600 * Math.max(retries, 1)));
     };
 
     const start = () => {
@@ -63,6 +77,7 @@ reloadTimer = window.setTimeout(() => {
       }
       if (!Hls.isSupported()) {
         setError("HLS is not supported by this browser");
+        reportState("error");
         return;
       }
 hls = new Hls({
@@ -72,12 +87,12 @@ hls = new Hls({
          maxBufferLength: 8,
          maxMaxBufferLength: 16,
          enableWorker: true,
-         manifestLoadingMaxRetry: 6,
-         manifestLoadingRetryDelay: 400,
-         levelLoadingMaxRetry: 6,
-         levelLoadingRetryDelay: 400,
-         fragLoadingMaxRetry: 6,
-         fragLoadingRetryDelay: 400,
+          manifestLoadingMaxRetry: 8,
+          manifestLoadingRetryDelay: 600,
+          levelLoadingMaxRetry: 8,
+          levelLoadingRetryDelay: 600,
+          fragLoadingMaxRetry: 8,
+          fragLoadingRetryDelay: 600,
          liveSyncDurationCount: 2,
          liveMaxLatencyDurationCount: 6,
          maxLiveSyncPlaybackRate: 1.2
@@ -101,6 +116,7 @@ hls = new Hls({
           play();
           return;
         }
+        reportState("error");
         reconnect();
       });
     };
@@ -108,7 +124,9 @@ hls = new Hls({
     const onPlaying = () => {
       retries = 0;
       lastProgress = Date.now();
+      frozenSince = null;
       setError("");
+      reportState("playing");
     };
 
     video.addEventListener("playing", onPlaying);
@@ -119,9 +137,20 @@ hls = new Hls({
       if (Number.isFinite(current) && current > lastTime + 0.05) {
         lastTime = current;
         lastProgress = Date.now();
+        frozenSince = null;
         return;
       }
-      if (Date.now() - lastProgress > 8000) reconnect();
+      if (frozenSince === null) frozenSince = Date.now();
+      if (Date.now() - frozenSince > 6000 && video.seekable && video.seekable.length) {
+        const edge = video.seekable.end(video.seekable.length - 1);
+        if (edge - current > 2) {
+          try { video.currentTime = Math.max(0, edge - 0.5); } catch {}
+          frozenSince = Date.now();
+          lastProgress = Date.now();
+          return;
+        }
+      }
+      if (Date.now() - lastProgress > 12000) reconnect();
     }, 2000);
 
     return () => {

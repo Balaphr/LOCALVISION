@@ -9,6 +9,7 @@ const responseCache = new Map<string, { at: number; value: unknown }>();
 
 const cacheTtlFor = (path: string): number => {
   const pathname = path.split("?")[0];
+  if (/^\/api\/cameras\/\d+\/(status|recording\/status)$/.test(pathname)) return 1000;
   if (pathname === "/api/metrics" || pathname === "/api/cameras" || pathname === "/api/recordings" || pathname.startsWith("/api/cameras/")) return 5000;
   if (pathname === "/api/events" || pathname === "/api/detections") return 3000;
   if (pathname.startsWith("/api/storage") || pathname.startsWith("/api/ai") || pathname === "/api/alerts") return 6000;
