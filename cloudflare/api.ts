@@ -1003,6 +1003,39 @@ const recordingsRoute = async (request: Request, env: Env, parts: string[], meth
       .slice((page - 1) * pageSize, page * pageSize);
     return json({ items, page, page_size: pageSize });
   }
+  if (parts.length === 3 && parts[2] === "dates" && method === "GET") {
+    const cameraId = Number(url.searchParams.get("camera_id"));
+    const cameraFilter = Number.isFinite(cameraId) && cameraId > 0 ? cameraId : null;
+    const visibleIds = await accessibleCameraIds(db, user);
+    if (cameraFilter && !visibleIds.includes(cameraFilter)) return json({ items: [] });
+    const storageViews = await storageRecordingViews(db, env);
+    const storageKeys = new Set(storageViews.map((item: any) => `${cameraKey(item.camera || item.camera_id)}|${item.date ?? ""}|${item.filename ?? ""}`));
+    const counts = new Map<string, number>();
+    const bump = (date: any) => {
+      const value = String(date ?? "");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return;
+      counts.set(value, (counts.get(value) ?? 0) + 1);
+    };
+    for (const item of storageViews) {
+      if (cameraFilter && Number(item.camera_id) !== cameraFilter) continue;
+      if (!cameraFilter && item.camera_id != null && !visibleIds.includes(Number(item.camera_id))) continue;
+      bump(item.date);
+    }
+    const params: any[] = [];
+    let sql = "SELECT camera_id,camera,date,filename FROM camera_recordings WHERE 1=1";
+    if (visibleIds.length) { sql += ` AND camera_id IN (${visibleIds.map(() => "?").join(",")})`; params.push(...visibleIds); }
+    else sql += " AND 1=0";
+    if (cameraFilter) { sql += " AND camera_id=?"; params.push(cameraFilter); }
+    for (const row of await all(db, sql, ...params)) {
+      const key = `${cameraKey(row.camera || row.camera_id)}|${row.date ?? ""}|${row.filename ?? ""}`;
+      if (storageKeys.has(key)) continue;
+      bump(row.date);
+    }
+    const items = [...counts.entries()]
+      .map(([date, count]) => ({ date, count }))
+      .sort((left, right) => right.date.localeCompare(left.date));
+    return json({ items });
+  }
   const id = Number(parts[2]);
   if (!Number.isFinite(id)) return fail("Recording not found", 404);
   const row = await recordingRowFor(env, id);

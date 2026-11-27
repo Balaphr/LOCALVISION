@@ -7,6 +7,7 @@ import secrets
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 import cv2
 import numpy as np
@@ -14,6 +15,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.concurrency import run_in_threadpool
 
 load_dotenv("/opt/localvision-storage/.env")
 
@@ -532,6 +534,68 @@ async def upload(request: Request, _: bool = Depends(authenticate)):
     }
 
 
+@app.post("/api/storage/upload/raw")
+async def upload_raw(request: Request, _: bool = Depends(authenticate)):
+    """Stream a recording straight to disk without buffering it in memory.
+
+    Used by the media bridge for hour-long files so uploads never stall the
+    event loop (live view, playback and AI detection keep running).
+    """
+    camera_name = safe_camera(request.headers.get("x-recording-camera", "Camera1"))
+    date_value = valid_date(request.headers.get("x-recording-date", ""), default=True)
+    time_value = request.headers.get("x-recording-time", "")
+    duration = valid_duration(request.headers.get("x-recording-duration-seconds", ""))
+    filename = safe_filename(unquote(request.headers.get("x-recording-filename", "")))
+    target = (RECORDINGS / camera_name / date_value / filename).resolve()
+    if not target.is_relative_to(RECORDINGS.resolve()):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if target.exists():
+        raise HTTPException(status_code=409, detail="Recording already exists")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    written = 0
+    try:
+        with tempfile.NamedTemporaryFile("wb", delete=False, dir=target.parent, prefix=".upload-", suffix=".part") as output:
+            temp_path = Path(output.name)
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Upload exceeds size limit")
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if written == 0:
+            raise HTTPException(status_code=400, detail="Empty upload")
+        try:
+            os.link(temp_path, target)
+        except FileExistsError:
+            raise HTTPException(status_code=409, detail="Recording already exists")
+        temp_path.unlink(missing_ok=True)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    stat = target.stat()
+    created_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()
+    return {
+        "id": recording_id(camera_name, date_value, filename),
+        "camera": camera_name,
+        "date": date_value,
+        "time": time_value,
+        "filename": filename,
+        "name": filename,
+        "path": str(target.relative_to(ROOT)),
+        "size_bytes": stat.st_size,
+        "created_at": created_at,
+        "mime_type": mimetypes.guess_type(filename)[0] or "video/mp4",
+        "duration_seconds": duration
+    }
+
+
 @app.post("/api/storage/ai/detect")
 async def ai_detect(request: Request, _: bool = Depends(authenticate)):
     fields, _, content = parse_upload(await request.body(), request.headers.get("content-type", ""))
@@ -548,7 +612,7 @@ async def ai_detect(request: Request, _: bool = Depends(authenticate)):
     settings = json_field(fields.get("settings", ""), {})
     if not isinstance(settings, dict):
         settings = {}
-    detections, snapshot_path = analyze_frame(camera_id, camera, timestamp, content, zones, settings)
+    detections, snapshot_path = await run_in_threadpool(analyze_frame, camera_id, camera, timestamp, content, zones, settings)
     return {
         "camera_id": camera_id,
         "camera": camera,

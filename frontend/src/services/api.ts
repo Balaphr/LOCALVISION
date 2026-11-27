@@ -10,7 +10,7 @@ const responseCache = new Map<string, { at: number; value: unknown }>();
 const cacheTtlFor = (path: string): number => {
   const pathname = path.split("?")[0];
   if (/^\/api\/cameras\/\d+\/(status|recording\/status)$/.test(pathname)) return 1000;
-  if (pathname === "/api/metrics" || pathname === "/api/cameras" || pathname === "/api/recordings" || pathname.startsWith("/api/cameras/")) return 5000;
+  if (pathname === "/api/metrics" || pathname === "/api/cameras" || pathname === "/api/recordings" || pathname === "/api/recordings/dates" || pathname.startsWith("/api/cameras/")) return 5000;
   if (pathname === "/api/events" || pathname === "/api/detections") return 3000;
   if (pathname.startsWith("/api/storage") || pathname.startsWith("/api/ai") || pathname === "/api/alerts") return 6000;
   if (pathname.startsWith("/api/auth/") || pathname === "/api/settings") return 3000;
@@ -76,6 +76,7 @@ export const cameraApi = {
 
 export const recordingApi = {
   list: (filters: { camera_id?: number; date?: string }) => request<RecordingPage>(`/api/recordings?${queryString(filters)}`),
+  dates: (cameraId?: number) => request<{ items: { date: string; count: number }[] }>(`/api/recordings/dates?${queryString({ camera_id: cameraId })}`),
   fileUrl: (id: number) => `/api/recordings/${id}/file`,
   remove: (id: number) => request<void>(`/api/recordings/${id}`, { method: "DELETE" }),
   review: (id: number, input: { status: string; notes?: string }) => request<Recording>(`/api/recordings/${id}/review`, { method: "PATCH", body: JSON.stringify(input) }),

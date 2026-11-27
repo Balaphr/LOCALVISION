@@ -20,6 +20,7 @@ const statusGroups = [
 
 export function RecordingsPage({ cameras }: { cameras: Camera[] }) {
   const [items, setItems] = useState<Recording[]>([]);
+  const [dates, setDates] = useState<{ date: string; count: number }[]>([]);
   const [cameraId, setCameraId] = useState("");
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
   const [selected, setSelected] = useState<Recording | null>(null);
@@ -42,6 +43,16 @@ export function RecordingsPage({ cameras }: { cameras: Camera[] }) {
       setError(reason instanceof Error ? reason.message : "Could not load recordings");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadDates = async () => {
+    try {
+      const result = await recordingApi.dates(cameraId ? Number(cameraId) : undefined);
+      setDates(result.items);
+      if (result.items.length && !result.items.some(entry => entry.date === date)) setDate(result.items[0].date);
+    } catch {
+      setDates([]);
     }
   };
 
@@ -84,6 +95,7 @@ export function RecordingsPage({ cameras }: { cameras: Camera[] }) {
   };
 
   useEffect(() => { void load(); }, [cameraId, date]);
+  useEffect(() => { void loadDates(); }, [cameraId]);
   useEffect(() => { if (video.current) video.current.playbackRate = speed; }, [speed, selected]);
 
   const statusCounts = items.reduce<Record<string, number>>((counts, item) => {
@@ -102,6 +114,11 @@ export function RecordingsPage({ cameras }: { cameras: Camera[] }) {
       <input type="date" value={date} onChange={event => setDate(event.target.value)} />
       <button onClick={() => void load()}>Refresh</button>
     </div>
+    {dates.length > 0 && <div className="recording-dates" aria-label="Recording dates">
+      {dates.map(entry => <button key={entry.date} type="button" className={`recording-date-chip ${date === entry.date ? "active" : ""}`} onClick={() => setDate(entry.date)}>
+        <b>{entry.date}</b><small>{entry.count} file{entry.count === 1 ? "" : "s"}</small>
+      </button>)}
+    </div>}
     <section className="recording-status-bar" aria-label="Recording status summary">
       <div className="recording-status-head"><span>Recording status</span><b>{items.length} total · {cameraCount} camera{cameraCount === 1 ? "" : "s"}</b></div>
       <div className="recording-status-track">

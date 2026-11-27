@@ -1,6 +1,8 @@
 import http from "node:http";
-import { spawn, execFileSync } from "node:child_process";
-import { mkdirSync, readdirSync, readFileSync, statSync, existsSync, unlinkSync } from "node:fs";
+import { spawn, execFile, execFileSync } from "node:child_process";
+import { mkdirSync, readdirSync, readFileSync, statSync, existsSync, unlinkSync, createReadStream } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { Readable } from "node:stream";
 import path from "node:path";
 import os from "node:os";
 import { timingSafeEqual } from "node:crypto";
@@ -48,7 +50,10 @@ const workerUrl = (process.env.WORKER_URL || "https://balasoftware.in").replace(
 const configInterval = Math.max(3000, Number(process.env.BRIDGE_CONFIG_INTERVAL_MS || 5000));
 const recordingRoot = process.env.STORAGE_ROOT || path.join(process.cwd(), "recordings");
 const hlsRoot = path.join(recordingRoot, "hls");
-const segmentSeconds = Math.max(30, Number(process.env.RECORDING_SEGMENT_SECONDS || 3600));
+// Recordings are always saved as one file per clock hour. Values below 3600 are ignored
+// so 1-minute / 5-minute segmenting can never be reintroduced through configuration.
+const segmentSeconds = Math.max(3600, Number(process.env.RECORDING_SEGMENT_SECONDS || 3600));
+const indexDays = Math.max(1, Number(process.env.RECORDING_INDEX_DAYS || 31));
 const localAiChatUrl = (process.env.LOCAL_AI_CHAT_URL || "http://127.0.0.1:8100").replace(/\/+$/, "");
 const localAiModelsUrl = (process.env.LOCAL_AI_MODELS_URL || "http://127.0.0.1:8200").replace(/\/+$/, "");
 
@@ -84,6 +89,7 @@ const sourceUrl = (request) => {
 };
 
 const safeName = (value) => String(value || "Camera").replace(/[^A-Za-z0-9_.-]+/g, "_").replace(/^[._]+|[._]+$/g, "") || "Camera";
+const transportArgs = (source) => /^rtsps?:\/\//i.test(String(source || "")) ? ["-rtsp_transport", "tcp"] : [];
 const redact = (text, source) => String(text || "").split(source).join("[redacted-source]").slice(-1200);
 const newDate = () => new Date();
 const datePart = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
@@ -119,8 +125,14 @@ const getSession = (id, camera) => {
       recordGeneration: 0,
       recordSource: "",
       recordActive: false,
+      recordSuppressed: false,
       recordIndex: null,
       lastRecordingAt: null,
+      sourceResolution: null,
+      sourceFps: null,
+      probedSource: "",
+      sourceProbedAt: null,
+      sourceProbeError: "",
       aiDesired: false,
       aiLoopActive: false,
       aiError: null,
@@ -134,6 +146,26 @@ const getSession = (id, camera) => {
   }
   if (camera) session.camera = camera;
   return session;
+};
+
+const probeSource = (session, source) => {
+  if (!source || session.probedSource === source) return;
+  session.probedSource = source;
+  session.sourceProbeError = "";
+  execFile(ffmpegPath, [
+    "-hide_banner", "-loglevel", "info", ...transportArgs(source),
+    "-analyzeduration", "2000000", "-probesize", "2000000",
+    "-i", source
+  ], { timeout: 20000, encoding: "utf8", windowsHide: true }, (error, stdout, stderr) => {
+    const text = `${stdout || ""}${stderr || ""}`;
+    const line = text.split(/\r?\n/).find((entry) => entry.includes("Video:")) || "";
+    const size = line.match(/(\d{2,5})x(\d{2,5})/);
+    const fps = line.match(/([\d.]+)\s*fps/) || line.match(/\btbr\s+([\d.]+)/);
+    if (size) session.sourceResolution = `${size[1]}x${size[2]}`;
+    if (fps) session.sourceFps = Number(fps[1]) || session.sourceFps;
+    session.sourceProbedAt = new Date().toISOString();
+    if (error && !session.sourceResolution) session.sourceProbeError = String(error.message || error).slice(0, 200);
+  });
 };
 
 const startHls = (session) => {
@@ -153,6 +185,7 @@ const startHls = (session) => {
   if (session.hlsStarting) return;
   session.hlsStarting = true;
   session.hlsSource = camera.source;
+  probeSource(session, camera.source);
   session.hlsError = "";
   session.hlsStatus = "starting";
   session.hlsFps = null;
@@ -168,7 +201,7 @@ const startHls = (session) => {
     ? ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt", "yuv420p"]
     : ["-c:v", videoEncoder, "-preset", "fast", "-pix_fmt", "yuv420p"];
   const args = [
-    "-hide_banner", "-stats", "-loglevel", "error", "-rtsp_transport", "tcp",
+    "-hide_banner", "-stats", "-loglevel", "error", ...transportArgs(camera.source),
     "-thread_queue_size", "512", "-fflags", "nobuffer+genpts", "-flags", "low_delay",
     "-analyzeduration", "500000", "-probesize", "500000",
     "-i", camera.source, "-an",
@@ -251,16 +284,28 @@ const reportRecording = async (metadata) => {
   return data.id ? Number(data.id) : null;
 };
 
-const uploadRecording = async (item) => {
-  if (!storageConfig?.endpoint) throw new Error("Storage API is not configured");
-  const bytes = await readFileSync(item.file);
+const recordingUploadHeaders = (item) => {
+  const headers = new Headers();
+  applyStorageAuth(headers, storageConfig);
+  headers.set("Content-Type", "video/mp4");
+  headers.set("X-Recording-Camera", String(item.metadata.camera ?? ""));
+  headers.set("X-Recording-Date", String(item.metadata.date ?? ""));
+  headers.set("X-Recording-Time", String(item.metadata.time ?? ""));
+  headers.set("X-Recording-Filename", encodeURIComponent(String(item.metadata.filename ?? "")));
+  if (item.metadata.camera_id !== null && item.metadata.camera_id !== undefined) headers.set("X-Recording-Camera-Id", String(item.metadata.camera_id));
+  if (item.metadata.duration_seconds !== null && item.metadata.duration_seconds !== undefined) headers.set("X-Recording-Duration-Seconds", String(item.metadata.duration_seconds));
+  return headers;
+};
+
+const uploadRecordingBuffered = async (item) => {
+  const bytes = await readFile(item.file);
   const form = new FormData();
   form.append("file", new Blob([bytes], { type: "video/mp4" }), item.metadata.filename);
   form.append("camera_id", String(item.metadata.camera_id));
   form.append("camera", item.metadata.camera);
   form.append("date", item.metadata.date);
   form.append("time", item.metadata.time);
-  form.append("duration_seconds", String(item.metadata.duration_seconds));
+  if (item.metadata.duration_seconds !== null && item.metadata.duration_seconds !== undefined) form.append("duration_seconds", String(item.metadata.duration_seconds));
   const headers = new Headers();
   applyStorageAuth(headers, storageConfig);
   const target = `${storageConfig.endpoint.replace(/\/+$/, "")}/api/storage/upload`;
@@ -268,7 +313,7 @@ const uploadRecording = async (item) => {
   let current = target;
   let response;
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    response = await fetch(current, { method: "POST", headers, body: form, redirect: "manual", signal: AbortSignal.timeout(120000) });
+    response = await fetch(current, { method: "POST", headers, body: form, redirect: "manual", signal: AbortSignal.timeout(1800000) });
     if (![301, 302, 303, 307, 308].includes(response.status)) break;
     const location = response.headers.get("location");
     if (!location) throw new Error(`Storage upload redirected without a target (${response.status})`);
@@ -276,6 +321,10 @@ const uploadRecording = async (item) => {
     if (redirected.origin !== original.origin) throw new Error("Storage upload redirect must stay on the same origin");
     current = redirected.toString();
   }
+  return response;
+};
+
+const finalizeUpload = async (item, response) => {
   if (response.ok || response.status === 409) {
     const saved = await response.json().catch(() => ({}));
     await reportRecording({
@@ -288,6 +337,31 @@ const uploadRecording = async (item) => {
     return;
   }
   throw new Error(`Storage upload failed (${response.status}): ${(await response.text()).slice(0, 300)}`);
+};
+
+const uploadRecording = async (item) => {
+  if (!storageConfig?.endpoint) throw new Error("Storage API is not configured");
+  const base = storageConfig.endpoint.replace(/\/+$/, "");
+  let response = null;
+  try {
+    response = await fetch(`${base}/api/storage/upload/raw`, {
+      method: "POST",
+      headers: recordingUploadHeaders(item),
+      body: Readable.toWeb(createReadStream(item.file)),
+      duplex: "half",
+      signal: AbortSignal.timeout(1800000)
+    });
+  } catch {
+    // Any streaming failure (duplex unsupported, connection torn down by an
+    // early 409, reset mid-transfer, ...) falls back to the buffered endpoint
+    // below, which always produces a clean response the finalizer can read.
+  }
+  if (response && (response.status >= 300 && response.status < 400 || [404, 405].includes(response.status))) {
+    if (response.body) await response.body.cancel().catch(() => {});
+    response = null;
+  }
+  if (!response) response = await uploadRecordingBuffered(item);
+  await finalizeUpload(item, response);
 };
 
 const drainUploadQueue = async () => {
@@ -361,7 +435,7 @@ const startAiFrames = (session) => {
     stopAiFrames(session);
   }
   const child = spawn(ffmpegPath, [
-    "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp",
+    "-hide_banner", "-loglevel", "error", ...transportArgs(camera.source),
     "-thread_queue_size", "512", "-fflags", "nobuffer", "-flags", "low_delay",
     "-analyzeduration", "1000000", "-probesize", "1000000",
     "-i", camera.source, "-an",
@@ -518,12 +592,21 @@ const ensureRecordingDirs = (folder) => {
 
 const recordingTemplate = (folder) => path.join(recordingRoot, "recordings", folder, "%Y-%m-%d", "%H-%M-%S.mp4");
 
-const recordingArgs = (source, folder) => [
-  "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp",
-  "-thread_queue_size", "512", "-fflags", "nobuffer", "-flags", "low_delay",
+const recordingEncoderArgs = (session) => {
+  const fps = Number(session.sourceFps) || 25;
+  const gop = String(Math.min(240, Math.max(30, Math.round(fps * 2))));
+  if (videoEncoder === "libx264") return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-g", gop, "-keyint_min", gop, "-sc_threshold", "0"];
+  if (videoEncoder === "h264_nvenc") return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "20", "-b:v", "0", "-pix_fmt", "yuv420p", "-g", gop];
+  if (videoEncoder === "h264_qsv") return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "20", "-pix_fmt", "yuv420p", "-g", gop];
+  return ["-c:v", videoEncoder, "-preset", "fast", "-pix_fmt", "yuv420p", "-g", gop];
+};
+
+const recordingArgs = (session, source, folder) => [
+  "-hide_banner", "-loglevel", "error", ...transportArgs(source),
+  "-thread_queue_size", "512", "-fflags", "+genpts",
   "-analyzeduration", "1000000", "-probesize", "1000000",
   "-i", source, "-an",
-  "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+  ...recordingEncoderArgs(session),
   "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
   "-f", "segment", "-segment_time", String(segmentSeconds),
   "-segment_atclocktime", "1", "-reset_timestamps", "1",
@@ -537,9 +620,12 @@ const indexStateFor = (session) => {
 
 const listRecordingFiles = (folder) => {
   const base = path.join(recordingRoot, "recordings", folder);
-  const days = [datePart(new Date(Date.now() - 86400000)), datePart(new Date())];
+  let days = [];
+  try { days = readdirSync(base).filter((name) => /^\d{4}-\d{2}-\d{2}$/.test(name)).sort(); } catch { return []; }
+  const cutoff = datePart(new Date(Date.now() - (indexDays - 1) * 86400000));
   const files = [];
   for (const day of days) {
+    if (day < cutoff) continue;
     let names = [];
     try { names = readdirSync(path.join(base, day)); } catch { continue; }
     for (const name of names) {
@@ -571,7 +657,8 @@ const indexRecordings = async (session, folder, final = false) => {
     const camera = session.camera;
     for (let index = 0; index < files.length; index += 1) {
       const entry = files[index];
-      const isOpen = index === files.length - 1 && !final && now - entry.mtime < 60000;
+      const recorderAlive = !!session.recordProcess && session.recordProcess.exitCode === null;
+      const isOpen = index === files.length - 1 && !final && (recorderAlive || now - entry.mtime < 60000);
       const status = isOpen ? "recording" : "ready";
       const previous = state.reported.get(entry.name);
       const changed = !previous || previous.size !== entry.size || previous.status !== status;
@@ -641,10 +728,12 @@ const runRecorder = async (session, generation) => {
       const camera = session.camera;
       const folder = cameraFolder(camera);
       ensureRecordingDirs(folder);
+      probeSource(session, camera.source);
       let stderr = "";
-      const child = spawn(ffmpegPath, recordingArgs(camera.source, folder), { stdio: ["pipe", "ignore", "pipe"] });
+      const child = spawn(ffmpegPath, recordingArgs(session, camera.source, folder), { stdio: ["pipe", "ignore", "pipe"] });
       session.recordProcess = child;
       session.recordStatus = "starting";
+      startIndexing(session, folder);
       child.stderr.on("data", (chunk) => { stderr = redact(`${stderr}${chunk}`, camera.source).slice(-1200); });
       child.once("spawn", () => {
         if (session.recordProcess === child && session.recordGeneration === generation) {
@@ -661,13 +750,18 @@ const runRecorder = async (session, generation) => {
       if (session.recordGeneration !== generation || !session.recordDesired) return;
       await indexRecordings(session, folder, false).catch(() => undefined);
       if (code === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await new Promise((resolve) => setTimeout(resolve, 500));
         continue;
       }
       session.recordStatus = "reconnecting";
       session.recordError = stderr || `Recording failed (${code})`;
       session.recordRestarts += 1;
-      await new Promise((resolve) => setTimeout(resolve, Math.min(10000, 1000 * session.recordRestarts)));
+      if (videoEncoder !== "libx264" && /encoder|nvenc|nvcuda|qsv|vaapi|cannot load|not found|unknown/i.test(stderr)) {
+        videoEncoder = "libx264";
+        session.recordRestarts = 0;
+        session.recordError = "";
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(10000, 500 * Math.max(session.recordRestarts, 1))));
     }
   } finally {
     if (session.recordGeneration === generation) session.recordActive = false;
@@ -705,11 +799,25 @@ const stopRecording = (session) => {
   stopIndexing(session);
   const child = session.recordProcess;
   session.recordProcess = null;
+  let finalScheduled = false;
+  const scheduleFinalIndex = (delay) => {
+    setTimeout(() => {
+      if (finalScheduled) return;
+      finalScheduled = true;
+      if (folder) void indexRecordings(session, folder, true).catch(() => undefined);
+    }, delay).unref();
+  };
   if (child && child.exitCode === null) {
     try { child.stdin?.write("q\n"); } catch {}
-    setTimeout(() => { try { if (child.exitCode === null) child.kill("SIGTERM"); } catch {} }, 2000).unref();
+    const termTimer = setTimeout(() => { try { if (child.exitCode === null) child.kill("SIGTERM"); } catch {} }, 2000);
+    termTimer.unref();
+    // Index only once the recorder process is really gone so a still-open file
+    // can never be handed to storage mid-write.
+    child.once("close", () => { clearTimeout(termTimer); scheduleFinalIndex(1000); });
+    scheduleFinalIndex(15000);
+  } else {
+    scheduleFinalIndex(3500);
   }
-  if (folder) setTimeout(() => { void indexRecordings(session, folder, true).catch(() => undefined); }, 3500).unref();
 };
 
 const applyConfig = (config) => {
@@ -722,14 +830,20 @@ const applyConfig = (config) => {
     const session = getSession(camera.id, camera);
     if (camera.enabled) startHls(session);
     else stopHls(session);
-    if (camera.recording_enabled) startRecording(session);
-    else stopRecording(session);
+    // An explicit local/worker stop stays in effect across config reloads; only an
+    // explicit start (or disabling the camera) clears it.
+    if (camera.recording_enabled && !session.recordSuppressed) startRecording(session);
+    else if (!camera.recording_enabled) {
+      session.recordSuppressed = false;
+      stopRecording(session);
+    }
     if (camera.enabled && camera.ai_enabled !== false) startAi(session);
     else stopAi(session);
   }
   for (const [id, session] of sessions) {
     if (nextIds.has(id)) continue;
     stopHls(session);
+    session.recordSuppressed = false;
     stopRecording(session);
     stopAi(session);
   }
@@ -748,7 +862,7 @@ const loadConfig = async () => {
 };
 
 const ffmpegArgs = (url, snapshot) => [
-  "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp",
+  "-hide_banner", "-loglevel", "error", ...transportArgs(url),
   "-fflags", "nobuffer", "-flags", "low_delay", "-analyzeduration", "1000000", "-probesize", "1000000",
   "-i", url, "-an",
   ...(snapshot ? ["-frames:v", "1"] : ["-vf", "fps=10,scale=640:-2"]),
@@ -876,6 +990,8 @@ const hlsStatus = (session) => {
     last_frame_at: lastFrameAt || session.hlsLastStatsAt,
     restarts: session.hlsRestarts,
     uptime_seconds: session.hlsStartedAt ? Math.max(0, (Date.now() - new Date(session.hlsStartedAt).getTime()) / 1000) : null,
+    source_resolution: session.sourceResolution ?? null,
+    source_fps: session.sourceFps ?? null,
     recording: session.recordStatus,
     recording_error: session.recordError || queueErrors[0] || null,
     last_recording_at: session.lastRecordingAt
@@ -1096,6 +1212,7 @@ http.createServer(async (request, response) => {
     }
     if (action === "record/start" && request.method === "POST") {
       try {
+        session.recordSuppressed = false;
         startRecording(session);
         sendJson(response, 200, { camera_id: session.id, status: session.recordStatus });
       } catch (error) {
@@ -1104,6 +1221,7 @@ http.createServer(async (request, response) => {
       return;
     }
     if (action === "record/stop" && request.method === "POST") {
+      session.recordSuppressed = true;
       stopRecording(session);
       sendJson(response, 200, { camera_id: session.id, status: session.recordStatus });
       return;
@@ -1116,6 +1234,8 @@ http.createServer(async (request, response) => {
         last_error: session.recordError || null,
         last_recording_at: session.lastRecordingAt,
         segment_seconds: segmentSeconds,
+        source_resolution: session.sourceResolution ?? null,
+        source_fps: session.sourceFps ?? null,
         restarts: session.recordRestarts
       });
       return;

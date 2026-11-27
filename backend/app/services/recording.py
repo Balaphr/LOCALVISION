@@ -18,7 +18,11 @@ class RecordingManager:
     def __init__(self, storage: LocalStorage | None = None, policy: RecordingPolicy | None = None):
         settings = get_settings()
         self.storage = storage or LocalStorage()
-        self.policy = policy or RecordingPolicy(segment_seconds=settings.recording_segment_seconds, retention_days=settings.retention_days)
+        segment_seconds = max(3600, int(settings.recording_segment_seconds))
+        chosen = policy or RecordingPolicy(segment_seconds=segment_seconds, retention_days=settings.retention_days)
+        if chosen.segment_seconds < 3600:
+            chosen = RecordingPolicy(segment_seconds=3600, retention_days=chosen.retention_days, mode=chosen.mode)
+        self.policy = chosen
 
     def next_segment_path(self, camera: Camera) -> Path:
         now = datetime.now(timezone.utc)
