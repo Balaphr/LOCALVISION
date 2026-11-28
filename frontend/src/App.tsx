@@ -33,7 +33,10 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [showLanding, setShowLanding] = useState(true);
-  const [page, setPage] = useState("dashboard");
+  const [page, setPage] = useState<string>(() => {
+    const persisted = localStorage.getItem("page");
+    return persisted ? String(persisted) : "dashboard";
+  });
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Camera | null>(null);
@@ -54,6 +57,12 @@ export default function App() {
     });
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    if (page) {
+      try { localStorage.setItem("page", page); } catch {}
+    }
+  }, [page]);
 
   const handleRealtime = useCallback((message: RealtimeMessage) => {
     if (message.type === "detection") setDetections(current => [message, ...current].slice(0, 16));

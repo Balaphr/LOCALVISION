@@ -66,7 +66,7 @@ export const cameraApi = {
     return { status: "saved" as const };
   },
   previewUrl: (id: number) => `/api/cameras/${id}/preview.jpg?t=${Date.now()}`,
-  streamUrl: (id: number) => `/api/cameras/${id}/stream.m3u8`,
+  streamUrl: (id: number) => `/api/cameras/${id}/stream.mjpeg`,
   mjpegUrl: (id: number) => `/api/cameras/${id}/stream.mjpeg`,
   recordStart: (id: number) => request<{ status: string; message?: string }>(`/api/cameras/${id}/recording/start`, { method: "POST" }),
   recordStop: (id: number) => request<{ status: string; message?: string }>(`/api/cameras/${id}/recording/stop`, { method: "POST" }),
